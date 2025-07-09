@@ -1,0 +1,60 @@
+# --- Security ---
+# NEVER commit the encrypted credentials file. This is the most important rule.
+credentials.enc
+# Also ignore any unencrypted or temporary credential files.
+*.env
+*.pem
+*.key
+
+# --- Python ---
+# Byte-compiled / optimized / C-extensions
+__pycache__/
+*.py[cod]
+*$py.class
+
+# C extensions
+*.so
+
+# Distribution / packaging
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Virtual Environments
+venv/
+.venv/
+env/
+.env/
+ENV/
+.tox/
+
+# --- Output ---
+# Ignore the generated report files. These are artifacts, not source code.
+output/
+
+# --- IDE / Editor ---
+# VS Code
+.vscode/
+# PyCharm
+.idea/
+
+# --- OS Specific ---
+# macOS
+.DS_Store
+# Windows
+Thumbs.db
