@@ -1,2 +1,1 @@
-# Site-Awareness-Dashboard
-Site Awareness Dashboard (SAD)
+# Site Awareness Dashboard (SAD)
