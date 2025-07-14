@@ -1,0 +1,37 @@
+# ====================================================================
+# Network Device Configuration
+#
+# This file lists the "seed" devices for each site. The orchestrator
+# uses the device with the 'discovery_seed' role as the starting
+# point to dynamically discover the rest of the site's topology.
+#
+# The 'site' name must be unique and is used as the target identifier.
+# ====================================================================
+
+- device_name: "nyc-core-router-01"
+  ip: "192.168.55.1"
+  site: "new_york"
+  type: "cisco_ios"
+  roles:
+    - "discovery_seed"
+
+- device_name: "newark-dist-switch-01"
+  ip: "192.168.94.1"
+  site: "newark"
+  type: "cisco_ios"
+  roles:
+    - "discovery_seed"
+
+- device_name: "lon-core-router-01"
+  ip: "172.16.20.1"
+  site: "london"
+  type: "cisco_nxos" # Example of a different OS type
+  roles:
+    - "discovery_seed"
+
+- device_name: "par-router-01"
+  ip: "172.17.10.1"
+  site: "paris"
+  type: "cisco_ios"
+  roles:
+    - "discovery_seed"
