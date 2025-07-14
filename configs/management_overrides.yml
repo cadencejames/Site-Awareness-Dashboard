@@ -1,0 +1,16 @@
+# ====================================================================
+# Management IP Overrides
+#
+# This file provides a mapping from a device's hostname (as seen in CDP)
+# to its true, reachable management IP address. The orchestrator will
+# use this IP for SSH/API connections instead of the one discovered via CDP.
+# ====================================================================
+
+# This switch is discovered via its data-plane IP, but we must use
+# its out-of-band management IP (10.100.55.10) to connect.
+nyc-access-switch-floor5:
+  management_ip: "10.100.55.10"
+
+# Another example for a different site.
+lon-access-switch-finance:
+  management_ip: "10.100.20.25"
