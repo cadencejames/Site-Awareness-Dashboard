@@ -1,0 +1,28 @@
+# ===================================================
+# Centralized Enterprise Services
+#
+# This file defines applications and infrastructure
+# that are shared across all sites.
+# ===================================================
+
+# Unified Communications Cluster
+# The conductor uses this for all VTC/Phone related queries.
+cucm_cluster:
+  publisher_ip: "10.100.1.10"
+  axl_version: "14.0"
+
+# Network Management Platforms (for future tools)
+nmp:
+  solarwinds_orion:
+    ip: "10.100.5.50"
+    api_type: "SWIS"
+  cisco_prime:
+    ip: "10.100.5.20"
+    api_version: "v4"
+
+# Core Infrastructure Services (for future tools)
+core_infra:
+  dns_servers:
+    primary: "10.100.2.5"
+    secondary: "10.100.2.6"
+  ntp_server: "10.100.2.1"
