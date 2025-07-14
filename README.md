@@ -1,165 +1,143 @@
 # Site Awareness Dashboard (SAD)
 
-The Site Awareness Dashboard is a Python-based orchestration platform that automatically collects, correlates, and reports on the real-time status of diverse IT systems across a network site.
+The Site Awareness Dashboard is a Python-based orchestration platform that automatically collects, correlates, and reports on the real-time status of diverse IT systems across one or more network sites. It is designed to handle complex, multi-site environments with shared services and provides a unified, up-to-date snapshot of a site's infrastructure.
 
 ## Overview
 
-In any complex IT environment, understanding the current state of all devices—network gear, servers, and user endpoints—is a constant challenge. This platform solves that problem by providing a single, powerful script (`orchestrator.py`) that acts as a central brain. It runs a series of specialized "tool" scripts to gather live data from various sources, correlates that data to build a rich, holistic view, and saves the output into human-readable YAML files.
-
-The end goal is to produce a "source of truth" data cache that can be used for reporting, troubleshooting, or as a backend for a web-based dashboard.
+This platform uses a powerful **Conductor/Worker** architecture to dynamically discover and inventory an entire network site from a single "seed" device. It intelligently gathers data from multiple sources, combines it into a group-wide data cache, and produces a series of detailed YAML reports that serve as a "source of truth" for the environment's state.
 
 ### Key Features
 
-*   **Modular Tool-Based Architecture:** Each data source (Cisco IOS, CUCM, VTC endpoints) has its own specialized tool, making the platform easy to maintain and extend.
-*   **Centralized Orchestration:** A single `orchestrator.py` script manages the entire data collection workflow.
-*   **Secure Credential Management:** All sensitive credentials are encrypted at rest in a `credentials.enc` file using a master password. The platform never stores passwords in plain text or in the source code.
-*   **Multi-Protocol Support:** Currently integrates with devices using SSH/CLI (Netmiko), AXL/SOAP (Requests), and device-specific XML/HTTPS APIs (xAPI).
-*   **Data Correlation & Enrichment:** The platform intelligently combines data from multiple sources. For example, it uses MAC addresses from CUCM to find IP addresses from an ARP table and then queries the device directly for its live status.
-*   **YAML-based Output:** All collected data is saved in a clean, structured, and human-readable YAML format, organized by site.
+*   **Hierarchical Group Processing:** Define simple or deeply nested groups of sites in a YAML file. The platform can run against a single site or an entire group (e.g., `all`, `east_coast`).
+*   **Dynamic Two-Phase Discovery:**
+    1.  **VLAN/Subnet Discovery:** Automatically discovers a site's local IP subnets from a single seed device.
+    2.  **Recursive Topology Discovery:** Uses the discovered subnets to perform a multi-hop discovery of all in-scope network devices via CDP.
+*   **Intelligent Filtering:** Discovery is precise, with configurable rules to ignore irrelevant devices (like phones), out-of-scope networks (WAN/transit links), and to handle devices with separate management IPs.
+*   **Secure, Centralized Credential Management:** A single master password entered once at runtime decrypts all necessary credentials. These are securely passed to worker processes via a temporary file cache that is automatically cleaned up.
+*   **Group-Wide Data Aggregation:** For group runs, the conductor aggregates data (like ARP tables) from all member sites to create a unified data cache for accurate, context-aware filtering.
+*   **Modular Architecture:** The system is cleanly separated into a smart `conductor`, a "dumb" `orchestrator` worker, a library of `tools`, and a `shared_utils` module for maximum maintainability and extensibility.
 
 ---
 
-## Architecture Diagram
+## Architecture
 
-The project is organized into a clear, scalable structure:
+The platform is designed around a clear separation of concerns.
+
+*   **`conductor.py` (The Brain):** The main script you run. It handles user input (target site/group), parses group definitions, manages the multi-phase workflow, aggregates data from multiple sites, and calls the orchestrator worker.
+*   **`orchestrator.py` (The Worker):** A "dumb" worker script that performs specific tasks for a single site when called by the conductor. It executes distinct phases like "discovery & ARP" or "live enrichment".
+*   **`shared_utils.py`:** A library of common helper functions (e.g., data formatters, recursive parsers) used by both the conductor and orchestrator to reduce code duplication.
+*   **`tools/`:** A package of specialist modules, each responsible for communicating with a specific type of system (e.g., Cisco IOS, CUCM AXL, VTC xAPI).
+*   **`configs/`:** A directory of YAML files that define the entire environment, including seed devices, site groups, and service endpoints.
 
 ```
 sad_platform/
-├── orchestrator.py             # The main script that manages the workflow.
-├── credential_loader.py        # Module to securely load encrypted credentials.
-├── credential_manager.py       # A CLI tool to manage (CRUD) credentials.
-├── credentials.enc             # The encrypted file storing all secrets (NOT committed to git).
+├── conductor.py              # The main script you run.
+├── orchestrator.py           # The worker script called by the conductor.
+├── shared_utils.py           # Common helper functions.
+├── credential_loader.py      # Securely loads encrypted credentials.
+├── credential_manager.py     # CLI tool to manage credentials.
+├── credentials.enc           # The encrypted secrets file (NEVER commit).
 │
-├── site_configs/               # Configuration files defining targets for each site.
-│   └── new_york.yml
+├── configs/
+│   ├── network_devices.yml   # Defines seed devices for each site.
+│   ├── site_groups.yml       # Defines simple or nested site groups.
+│   ├── services.yml          # Defines centralized enterprise services (CUCM, DNS, etc.).
+│   └── management_overrides.yml # Maps device names to reachable management IPs.
 │
-├── tools/                        # A package of specialist data-gathering modules.
-│   ├── __init__.py
-│   ├── cisco_arp_tool.py
-│   ├── cucm_vtc_tool.py
-│   └── vtc_api_tool.py
-│
-├── output/                       # Generated reports are saved here, organized by run.
-│   └── arp.yml
-│   └── vtc_devices.yml
-│
-└── requirements.txt            # Project dependencies.
+└── tools/
+    └── ...
 ```
 
 ---
 
 ## Getting Started
 
-Follow these steps to set up the project on a new machine.
-
 ### Prerequisites
 
 *   Python 3.8+
-*   Access to the network devices, CUCM, and VTC endpoints you wish to query.
+*   Git
 
 ### Installation
 
 1.  **Clone the repository:**
     ```bash
-    git clone https://github.com/cadencejames/Site-Awareness-Dashboard.git
+    git clone <your-repo-url>
     cd sad_platform
     ```
 
-2.  **Create and activate a virtual environment (recommended):**
+2.  **Create and activate a virtual environment:**
     ```bash
-    # For Linux/macOS
-    python3 -m venv venv
-    source venv/bin/activate
-
-    # For Windows
     python -m venv venv
-    .\venv\Scripts\activate
+    source venv/bin/activate
     ```
 
 3.  **Install dependencies:**
-    This project relies on several key libraries. Install them all using the `requirements.txt` file.
     ```bash
     pip install -r requirements.txt
     ```
-
-    _If `requirements.txt` does not exist, create it with the following content:_
+    _Your `requirements.txt` should contain:_
     ```
     netmiko
     requests
     lxml
     cryptography
+    pyyaml
+    ntc-templates
     ```
+
 ---
 
 ## Configuration
 
-Before running the orchestrator, you must configure your credentials and target devices.
-
 ### 1. Configure Credentials
+Use the `credential_manager.py` to create your `credentials.enc` file.
+```bash
+python credential_manager.py
+```
+Ensure you create keys for all required services (e.g., `net_user`, `net_pass`, `cucm_user`, `cucm_pass`, etc.).
 
-This platform uses an encrypted file (`credentials.enc`) for all secrets. You must create this file using the provided `credential_manager.py` script.
+### 2. Configure Your Environment
+Populate the YAML files in the `configs/` directory:
 
-1.  **Run the credential manager to add secrets:**
-    ```bash
-    python credential_manager.py
-    ```
-
-2.  Follow the prompts to create the file and add the necessary key-value pairs. The `orchestrator.py` script currently requires the following keys:
-    *   `net_user`: Username for network devices (e.g., switches/routers).
-    *   `net_pass`: Password for network devices.
-    *   `cucm_user`: Username for CUCM AXL API.
-    *   `cucm_pass`: Password for CUCM AXL API.
-    *   `vtc_user`: Local admin username for VTC endpoints.
-    *   `vtc_pass`: Local admin password for VTC endpoints.
-
-    **Note:** The `credentials.enc` file is explicitly ignored by `.gitignore` and should **NEVER** be committed to version control.
-
-### 2. Configure Site Targets
-
-Device IP addresses are hardcoded in `orchestrator.py` for simplicity. For production use, it is recommended to move these to a `site_configs/` YAML file.
+1.  **`services.yml`:** Define your centralized enterprise applications (CUCM, DNS, etc.).
+2.  **`network_devices.yml`:** Define the **seed device** for each individual site. Each entry must have a unique `site` name and the `discovery_seed` role.
+3.  **`site_groups.yml`:** Define your operational groups. You can create simple flat groups or complex, nested hierarchies. The key is the name you will use with the `--target` flag.
+4.  **`management_overrides.yml`:** (Optional) Add entries for any devices that must be accessed via a specific management IP that differs from their CDP-advertised IP.
 
 ---
 
 ## Usage
 
-To run the full data collection and enrichment process:
+You will always interact with the platform via the `conductor.py` script. It accepts a single required argument: `--target`.
 
-1.  Navigate to the root project directory (`sad_platform/`).
-2.  Ensure your virtual environment is activated.
-3.  Execute the orchestrator script:
+The target can be the name of an individual site or a group defined in `site_groups.yml`.
+
+1.  **Run against a single site:**
     ```bash
-    python orchestrator.py
+    python conductor.py --target newark
     ```
-4.  You will be prompted to enter the **master password** to unlock the `credentials.enc` file.
-5.  The script will provide console output as it progresses through each stage of data collection.
-6.  Upon completion, the final reports will be saved in the `output/` directory as `.yml` files.
+
+2.  **Run against a simple group:**
+    (Assuming `emea: [london, paris]` exists in `site_groups.yml`)
+    ```bash
+    python conductor.py --target emea
+    ```
+    This will process the `london` and `paris` sites sequentially.
+
+3.  **Run against a nested group:**
+    (Assuming `all: [united_states: [...], europe: [...]]` exists)
+    ```bash
+    python conductor.py --target all
+    ```
+    The conductor will recursively find every individual site defined under the `all` key and process them.
+
+Upon execution, you will be prompted for your master password once. The conductor will then orchestrate the multi-phase run, and all output files will be saved into site-specific directories within `output/`.
 
 ---
 
 ## Roadmap
 
-This platform is under active development. Future enhancements include:
-
-*   [ ] **Add a CDP/LLDP Tool:** Create `cisco_cdp_tool.py` to map network topology.
-*   [ ] **Add a Server Status Tool:** Create a tool to check the status of Windows/Linux servers via WinRM or SSH.
-*   [ ] **Dynamic Site Configuration:** Enhance `orchestrator.py` to accept a command-line argument (`--site new_york`) to load different site configuration files.
+*   [ ] **Add Interface Status Tool:** Create a tool to collect `show interface status` from all discovered devices.
+*   [ ] **Add Server Status Tool:** Create a tool to check the status of Windows/Linux servers via WinRM or SSH.
 *   [ ] **Web Front-End:** Develop a simple web application (using Flask or Django) that reads the YAML files from the `output/` directory and displays them in a user-friendly dashboard.
-*   [ ] **Fully Automated Runs:** Adapt the credential system to allow for non-interactive execution in CI/CD pipelines or scheduled tasks.
-
----
-
-## Contributing
-
-Contributions are welcome! If you have an idea for a new tool or an improvement, please feel free to fork the repository and submit a pull request.
-
-1.  Fork the Project
-2.  Create your Feature Branch (`git checkout -b feature/AmazingFeature`)
-3.  Commit your Changes (`git commit -m 'Add some AmazingFeature'`)
-4.  Push to the Branch (`git push origin feature/AmazingFeature`)
-5.  Open a Pull Request
-
----
-
-## License
-
-Distributed under the MIT License. See `LICENSE.txt` for more information.
+*   [ ] **Parallel Execution:** Enhance the conductor to run independent site collections in parallel to speed up large group runs.
