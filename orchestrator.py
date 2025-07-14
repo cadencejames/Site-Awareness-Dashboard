@@ -1,126 +1,144 @@
 import os
-from cryptography.exceptions import InvalidTag
-
-# --- Local Imports ---
-import credential_loader 
-from tools import cisco_arp_tool, cucm_vtc_tool, vtc_api_tool
+import yaml
+import argparse
+import json
+# --- Local Module Imports ---
+import shared_utils
+from tools import cisco_arp_tool, cisco_cdp_tool, cisco_vlan_tool, vtc_api_tool
 
 # --- Configuration ---
-CREDENTIALS_FILE = "./credentials.enc"
-NETWORK_DEVICE_IP = '192.168.1.1' 
-CUCM_IP = '192.168.1.10'
-ARP_OUTPUT_FILE = 'output/arp.yml'
-VTC_OUTPUT_FILE = 'output/vtc.yml'
+CONFIG_DIR = "./configs/"
+OUTPUT_DIR = "./output/"
+DISCOVERY_EXCLUSION_PATTERNS = ["SEP*", "*spine*", "*leaf*"]
 
-# --- Helper Functions ---
-def normalize_mac(mac_address: str) -> str:
-    # Sterilizes mac addresses
-    return mac_address.upper().replace('SEP', '').replace(':', '').replace('.', '').replace('-', '').lower()
+# --- Main Phase Functions ---
+def do_discovery_and_arp_phases(site_name, site_seed_device, creds, mgmt_overrides):
+    # Phase 1: Discovery topology and collect all ARP data for a single site.
+    print(f"--- Starting Discovery & ARP Phase for site: {site_name} ---")
+    output_dir = f"{OUTPUT_DIR}{site_name}/"
+    os.makedirs(output_dir, exist_ok=True)
+    subnet_info = cisco_vlan_tool.get_vlan_and_subnet_info(site_seed_device, creds['net_user'], creds['net_pass'])
+    site_subnets = subnet_info.get('subnet_list', [])
+    if not site_subnets:
+        print("Critical Error: No subnets discovered. Aborting.")
+        return False
+    shared_utils.save_data_to_yaml(f"{output_dir}discovered_vlans.yml", subnet_info, 'vlan_info')
 
-def format_dict_to_yaml(data: dict, root_key: str) -> str:
-    # Manually formats a dictionary of dictionaries into a YAML-like string.
-    yaml_lines = [f"{root_key}:"]
-    for primary_key, details_dict in data.items():
-        yaml_lines.append(f"  {primary_key}:")
-        for sub_key, value in details_dict.items():
-            yaml_lines.append(f"    {sub_key}: {value}")
-    return "\n".join(yaml_lines)
-
-def format_list_to_yaml(data_list: list, root_key: str) -> str:
-    # Manually formats a list of dictionaries into a YAML-like string.
-    yaml_lines = [f"{root_key}:"]
-    for item in data_list:
-        first_key = list(item.keys())[0]
-        yaml_lines.append(f"- {first_key}: {item[first_key]}")
-        for key, value in list(item.items())[1:]:
-            yaml_lines.append(f"  {key}: {value}")
-    return "\n".join(yaml_lines)
-
-# --- Main execution block ---
-if __name__ == "__main__":
-    print("--- Site Awareness Dashboard (SAD) ---")
-    # 1. Load All Credentials Securely
-    try:
-        master_password = credential_loader.getpass.getpass("Enter master password for credentials file: ")
-        creds = credential_loader.load_credentials(CREDENTIALS_FILE, master_password)
-        # Extract credentials needed for this run
-        net_user = creds.get('net_user')
-        net_pass = creds.get('net_pass')
-        cucm_user = creds.get('cucm_user')
-        cucm_pass = creds.get('cucm_pass')
-        vtc_user = creds.get('vtc_user')
-        vtc_pass = creds.get('vtc_pass')
-
-        if not all([net_user, net_pass, cucm_user, cucm_pass, vtc_user, vtc_pass]):
-            raise ValueError("One or more required keys are missing from the credentials file.")
-        print("Credentials successfully loaded and decrypted.")
-    except (FileNotFoundError, InvalidTag, ValueError) as e:
-        print(f"\nCritical Error: Could not load credentials. {e}")
-        exit()
-    # Create output directory if it doesn't exist
-    os.makedirs('output', exist_ok=True)
-    
-    # --- TASK 1: Get and Save Full ARP Table ---
-    print(f"\n--- Step 1. Fetching ARP table from {NETWORK_DEVICE_IP} ---")
-    arp_device_info = {'device_type': 'cisco_ios', 'host': NETWORK_DEVICE_IP, 'username': net_user, 'password': net_pass,}
-    full_arp_data = cisco.arp_tool.get_cisco_arp_dict(arp_device_info)
-    if not full_arp_data:
-        print("\nCritical Error: Could not retrieve ARP data. Exiting.")
-        exit()
-    try:
-        arp_yaml_output = format_dict_to_yaml(full_arp_data, 'arp_table')
-        with open(ARP_OUTPUT_FILE, 'w') as f:
-            f.write(arp_yaml_output)
-        print(f"Success! Full ARP table saved to '{ARP_OUTPUT_FILE}'")
-    except IOError as e:
-        print(f"Error writing ARP file: {e}")
-
-    # --- TASK 2: Get CUCM Data, then Enrich with ARP and Live Status ---
-    print(f"\n--- STEP 2: Fetching VTC data from {CUCM_IP} ---")
-    vtc_devices = cucm_vtc_tool.get_vtc_devices(CUCM_IP, cucm_user, cucm_pass)
-
-    if not vtc_devices:
-        print("\nSkipping VTC enrichment: Could not retrieve VTC device data.")
-        exit()
-
-    print("\n--- STEP 3: Correlating Data and Querying Live Device Status ---")
-    mac_to_ip_map = {normalize_mac(details['mac_address']): ip for ip, details in full_arp_data.items()}
-    
-    enriched_vtc_list = []
-    total_devices = len(vtc_devices)
-    
-    for i, device in enumerate(vtc_devices, 1):
-        vtc_mac_normalized = normalize_mac(device['device_name'])
+    standardized_seed = {'device_name': site_seed_device.get('device_name', site_seed_device['ip']), 'ip': site_seed_device['ip'], 'type': site_seed_device.get('type', 'cisco_ios')}
+    devices_to_scan = [standardized_seed]
+    discovered_topology, discovered_by_name, scanned_ips = {}, {}, set()
+    while devices_to_scan:
+        current_device = devices_to_scan.pop(0)
+        current_ip = current_device['ip']
+        if current_ip in scanned_ips:
+            continue
+        neighbors = cisco_cdp_tool.get_discovered_devices(current_device, creds['net_user'], creds['net_pass'])
+        scanned_ips.add(current_ip)
+        if current_ip not in discovered_topology:
+            discovered_topology[current_ip] = current_device
+            if 'device_name' in current_device:
+                discovered_by_name[current_device['device_name']] = current_ip
+        if neighbors is None:
+            continue
         
-        # Find IP address from ARP data
-        ip_address = mac_to_ip_map.get(vtc_mac_normalized, "OFFLINE")
+        for neighbor in neighbors:
+            neighbor_name = neighbor.get('device_name', '')
+            override_info = mgmt_overrides.get(neighbor_name)
+            neighbor_ip = override_info.get('management_ip') if override_info else neighbor.get('ip_address')
+            if shared_utils.is_excluded(neighbor_name, DISCOVERY_EXCLUSION_PATTERNS):
+                continue
+            if not neighbor_ip or not shared_utils.is_ip_in_subnets(neighbor_ip, site_subnets) or neighbor_name in discovered_by_name:
+                continue
+            standardized_neighbor = {'device_name': neighbor_name, 'ip': neighbor_ip, 'type': 'cisco_ios', 'platform': neighbor.get('platform', 'N/A')}
+            devices_to_scan.append(standardized_neighbor)
+            discovered_topology[neighbor_ip] = standardized_neighbor
+            discovered_by_name[neighbor_name] = neighbor_ip
+    shared_utils.save_data_to_yaml(f"{output_dir}discovered_topology.yml", list(discovered_topology.values()), 'devices')
+
+    full_arp_table = {}
+    for device in discovered_topology.values():
+        arp_data = cisco_arp_tool.get_cisco_arp_dict(device, creds['net_user'], creds['net_pass'])
+        if arp_data:
+            full_arp_table.update(arp_data)
+    shared_utils.save_data_to_yaml(f"{output_dir}arp_table.yml", full_arp_table, 'arp_table')
+    return True
+
+def do_enrichment_phase(site_name, creds):
+    # Phase 2: Perform live enrichment on a pre-filtered list of devices
+    print(f"--- Starting Live Enrichment Phase for site: {site_name} ---")
+    output_dir = f"{OUTPUT_DIR}{site_name}/"
+    group_arp_cache_path = os.getenv('SAD_GROUP_ARP_CACHE')
+    if not group_arp_cache_path:
+        print("Worker Error: SAD_GROUP_ARP_CACHE environment variable not set. Cannot load ARP data.")
+        return False
+    try:
+        with open(f"{output_dir}devices_to_enrich.yml", 'r') as f:
+            devices_to_enrich = yaml.safe_load(f).get('vtc_devices', [])
+        with open(group_arp_cache_path, 'r') as f:
+            group_arp_table = json.load(f)
+    except FileNotFoundError as e:
+        print(f"Error: Required input file not found for enrichment phase: {e}")
+        return False
+
+    mac_to_ip_map = {shared_utils.normalize_mac(details['mac_address']): ip for ip, details in group_arp_table.items()}
+    enriched_list = []
+
+    for device in devices_to_enrich:
+        vtc_mac_normalized = shared_utils.normalize_mac(device['device_name'])
+        ip_address = mac_to_ip_map.get(vtc_mac_normalized)
         device['ip_address'] = ip_address
-        
-        print(f"  -> Processing device {i}/{total_devices}: {device['device_name']}...", end='')
-        
-        # If the device has an IP, try to query its live status
-        if ip_address != "OFFLINE":
-            live_status = vtc_api_tool.get_device_status(ip_address, vtc_user, vtc_pass)
-            
+        if ip_address:
+            live_status = vtc_api_tool.get_device_status(ip_address, creds['vtc_user'], creds['vtc_pass'])
             if live_status:
-                # Successfully got status, merge it into the device's dictionary
                 device.update(live_status)
-                print(" [STATUS OK]")
             else:
-                # Could not connect (bad password, firewall, offline but still in ARP)
                 device['live_status'] = "UNREACHABLE"
-                print(" [STATUS FAILED]")
         else:
-            print(" [OFFLINE]")
+            device['ip_address'] = "NOT_FOUND_IN_GROUP_ARP"
+        enriched_list.append(device)
+    shared_utils.save_data_to_yaml(f"{output_dir}vtc_devices_enriched.yml", enriched_list, 'vtc_devices')
+    return True
 
-        enriched_vtc_list.append(device)
-    
-    # --- TASK 3: Write final enriched report ---
-    print(f"\n--- Step 3. Writing enriched VTC report ---")
-    vtc_yaml_output = format_list_to_yaml(enriched_vtc_list, 'vtc_devices')
+# --- Main Execution Block for the Worker ---
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="SAD Worker Orchestrator")
+    parser.add_argument("--site", required=True, help="The individual site to process.")
+    parser.add_argument("--phase", required=True, choices=['discovery_and_arp', 'enrichment'], help="The execution phase.")
+    args = parser.parse_args()
+
+    # --- Retrieve credentials from temp credential file
+    temp_creds_path = os.getenv('SAD_TEMP_CREDS_FILE')
+    if not temp_creds_path:
+        print("Worker Error: SAD_TEMP_CREDS_FILE environment variable not set. Cannot load credentials.")
+        exit(1)
     try:
-        with open(VTC_OUTPUT_FILE, 'w') as f:
-            f.write(vtc_yaml_output)
-        print(f"\n --- All tasks complete. Enriched VTC data saved to '{VTC_OUTPUT_FILE}' ---")
-    except IOError as e:
-        print(f"--- Error writing VTC file: {e} ---")
+        with open(temp_creds_path, 'r') as f:
+            creds = json.load(f)
+        with open(f"{CONFIG_DIR}network_devices.yml", 'r') as f:
+            all_network_devices = yaml.safe_load(f)
+        with open(f"{CONFIG_DIR}management_overrides.yml", 'r') as f:
+            mgmt_overrides = yaml.safe_load(f) or {}
+    except (FileNotFoundError, json.JSONDecodeError, yaml.YAMLError) as e:
+        print(f"Worker Error: Could not load initial configurations. Reason: {e}")
+        exit(1)
+    
+    site_device_config = [dev for dev in all_network_devices if dev.get('site') == args.site]
+    if not site_device_config:
+        print(f"Worker Error: No devices found for site '{args.site}' in network_devices.yml")
+    
+    success = False
+    if args.phase == 'discovery_and_arp':
+        seed_device = shared_utils.find_device_by_role(site_device_config, 'discovery_seed')
+        if not seed_device:
+            print(f"Worker Error: No 'discovery_seed' device found for site '{args.site}'.")
+            exit(1)
+        success = do_discovery_and_arp_phases(args.site, seed_device, creds, mgmt_overrides)
+    elif args.phase == 'enrichment':
+        success = do_enrichment_phase(args.site, creds)
+    
+    if not success:
+        print(f"Worker for site '{args.site}' phase '{args.phase}' failed.")
+        exit(1)
+    else:
+        print(f"Worker for site '{args.site}' phase '{args.phase}' completed successfully.")
+        exit(0)
