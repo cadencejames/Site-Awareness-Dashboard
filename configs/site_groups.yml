@@ -1,0 +1,24 @@
+# ====================================================================
+# Site Group Definitions
+#
+# This file allows you to create logical groupings of individual sites.
+# The conductor can target a group name to process all member sites.
+# The structure can be deeply nested.
+# ====================================================================
+
+all:
+  - united_states:
+    - east_coast:
+        # The 'new_york' key is also a group itself, containing its sub-site.
+        - new_york:
+            - "new_york"
+            - "newark"
+    - west_coast:
+        - "los_angeles"
+        - "seattle"
+    # A site can also be a direct member of a larger group.
+    - "chicago"
+
+  - emea:
+    - "london"
+    - "paris"
