@@ -31,18 +31,18 @@ The platform is designed around a clear separation of concerns.
 
 ```
 sad_platform/
-├── conductor.py              # The main script you run.
-├── orchestrator.py           # The worker script called by the conductor.
-├── shared_utils.py           # Common helper functions.
-├── credential_loader.py      # Securely loads encrypted credentials.
-├── credential_manager.py     # CLI tool to manage credentials.
-├── credentials.enc           # The encrypted secrets file (NEVER commit).
+├── conductor.py                    # The main script you run.
+├── orchestrator.py                 # The worker script called by the conductor.
+├── shared_utils.py                 # Common helper functions.
+├── credential_loader.py            # Securely loads encrypted credentials.
+├── credential_manager.py           # CLI tool to manage credentials.
+├── credentials.enc                 # The encrypted secrets file (NEVER commit).
 │
 ├── configs/
-│   ├── network_devices.yml   # Defines seed devices for each site.
-│   ├── site_groups.yml       # Defines simple or nested site groups.
-│   ├── services.yml          # Defines centralized enterprise services (CUCM, DNS, etc.).
-│   └── management_overrides.yml # Maps device names to reachable management IPs.
+│   ├── network_devices.yml         # Defines seed devices for each site.
+│   ├── site_groups.yml             # Defines simple or nested site groups.
+│   ├── services.yml                # Defines centralized enterprise services (CUCM, DNS, etc.).
+│   └── management_overrides.yml    # Maps device names to reachable management IPs.
 │
 └── tools/
     └── ...
