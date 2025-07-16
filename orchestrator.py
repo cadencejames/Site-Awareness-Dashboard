@@ -4,7 +4,7 @@ import argparse
 import json
 # --- Local Module Imports ---
 import shared_utils
-from tools import cisco_arp_tool, cisco_cdp_tool, cisco_vlan_tool, vtc_api_tool
+from tools import cisco_arp_tool, cisco_cdp_tool, cisco_config_tool, cisco_vlan_tool, vtc_api_tool
 
 # --- Configuration ---
 CONFIG_DIR = "./configs/"
@@ -99,11 +99,64 @@ def do_enrichment_phase(site_name, creds):
     shared_utils.save_data_to_yaml(f"{output_dir}vtc_devices_enriched.yml", enriched_list, 'vtc_devices')
     return True
 
+def do_config_backup_phase(site_name, creds):
+    # Phase 3: Backs up the running configuration for all discovered devices at a specific site, archiving old configs if changes are detected.
+    print(f"--- Starting Configuration Backup Phase for site: {site_name} ---")
+    # Define paths
+    site_output_dir = f"{OUTPUT_DIR}{site_name}/"
+    config_backup_dir = f"{site_output_dir}configs/"
+    archive_dir = f"{config_backup_dir}archive/"
+    os.makedirs(archive_dir, exist_ok=True)
+    
+    # This phase depends on the discovery phase having run first
+    try:
+        with open(f"{site_output_dir}discovered_topology.yml", 'r') as f:
+            discovered_devices = yaml.safe_load(f).get('devices', [])
+    except FileNotFoundError:
+        print(f"Error: Cannot run backup. 'discovered_topology.yml' not found for site '{site_name}'.")
+        return False
+    for device in discovered_devices:
+        device_name = device.get('device_name')
+        if not device_name:
+            continue
+        print(f"  -> Processing config for: {device_name}")
+        
+        # Get the new config and its hash
+        new_config, new_hash = cisco_config_tool.get_config_and_hash(device, creds['net_user'], creds['net_pass'])
+        if not new_config:
+            print(f"    - Skipping {device_name} (could not fetch config).")
+            continue
+        current_config_path = f"{config_backup_dir}{device_name}.txt"
+        old_hash = ""
+        
+        # Try to read the old config file to get its hash
+        if os.path.exists(current_config_path):
+            with open(current_config_path, 'r') as f:
+                old_config = f.read()
+                old_hash = cisco_config_tool.calculate_md5(old_config)
+        
+        # Compare hashes
+        if new_hash == old_hash:
+            print(f"    - No changes detected for {device_name}.")
+        else:
+            print(f"    - CHANGE DETECTED for {device_name}. Backing up new config.")
+            # If an old file exists, move it to the archive
+            if os.path.exists(current_config_path):
+                import datetime
+                timestamp = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+                archive_path = f"{archive_dir}{device_name}_{timestamp}.txt"
+                os.rename(current_config_path, archive_path)
+                print(f"    - Archived old config to: {archive_path}")
+            # Write the new config file
+            with open(current_config_path, 'w') as f:
+                f.write(new_config)
+    return True
+
 # --- Main Execution Block for the Worker ---
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="SAD Worker Orchestrator")
     parser.add_argument("--site", required=True, help="The individual site to process.")
-    parser.add_argument("--phase", required=True, choices=['discovery_and_arp', 'enrichment'], help="The execution phase.")
+    parser.add_argument("--phase", required=True, choices=['discovery_and_arp', 'enrichment', 'backup_configs'], help="The execution phase.")
     args = parser.parse_args()
 
     # --- Retrieve credentials from temp credential file
@@ -135,6 +188,8 @@ if __name__ == "__main__":
         success = do_discovery_and_arp_phases(args.site, seed_device, creds, mgmt_overrides)
     elif args.phase == 'enrichment':
         success = do_enrichment_phase(args.site, creds)
+    elif args.phase == 'backup_configs':
+        success = do_config_backup(args.site, creds)
     
     if not success:
         print(f"Worker for site '{args.site}' phase '{args.phase}' failed.")
