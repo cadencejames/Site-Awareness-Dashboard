@@ -17,8 +17,8 @@ ORCHESTRATOR_SCRIPT = "orchestrator.py"
 CREDENTIALS_FILE = "./credentials.enc"
 
 def get_sites_to_process(target: str, groups_config_file: str) -> list:
-    # Determines the list of individual sites to run based on the target
-    # Handles deeply nested group definitions by searching for the target key and then flattening the result
+    # Determines the list of individual sites to run based on the target.
+    # Handles deeply nested group definitions by searching for the target key and then flattening the result.
     try:
         with open(groups_config_file, 'r') as f:
             site_groups = yaml.safe_load(f) or {}
@@ -29,19 +29,19 @@ def get_sites_to_process(target: str, groups_config_file: str) -> list:
         print(f"Error: Could not parse site groups file '{groups_config_file}'. Reason {e}")
         return []
     # Stage 1: Search the entire YAML structure for our target key using the shared helper.
-    # The search starts from the root of the loaded YAML data.
+    # The search starts from the root of the loaded YAML data.        
     target_node = shared_utils._find_target_node_recursive(site_groups, target)
     if target_node is not None:
         # Target key was found. Now, flatten its contents to get the final list of site names.
         print(f"Target '{target}' found as a group. Recursively resolving all member sites...")
         resolved_sites = set()
-        # Call the second helper to traverse the found node and collect all the site strings.
+        # Call the second helper to traverse teh found node and collect all the site strings.
         shared_utils._flatten_sites_recursive(target_node, resolved_sites)
         # Return a sorted list for consistent, predictable execution order
         return sorted(list(resolved_sites))
     else:
-        # If the target key was not found anywhere in the group file
-        # then we treat the target itself as the name of the single, individual site
+        # If the target key was found anywhere in the group file,
+        # then we treat the target itself as the name of the single, individual site.
         print(f"Target: '{target}' not found as a group. Processing as a single site.")
         return [target]
     
@@ -49,6 +49,7 @@ def get_sites_to_process(target: str, groups_config_file: str) -> list:
 def main():
     parser = argparse.ArgumentParser(description="SAD Platform Conductor")
     parser.add_argument("--target", required=True, help="The site or group to process.")
+    parser.add_argument("--run-mode", default="full", choices=['full', 'discovery_only', 'backup_configs'], help="Specify the operational workflow to run.")
     args = parser.parse_args()
     print("--- SAD Platform Conductor ---")
 
@@ -78,7 +79,7 @@ def main():
             exit(1)
         print(f"\nFinal list of sites to be processed: {sites_to_process}")
 
-        # --- 4. Phase 1: Run Discovery and ARP for all sites ---
+        # --- 4. Phase 1: Run Discovery and ARP for all sites (Required for most modes) ---
         print("\n--- CONDUCTOR PHASE 1: DISCOVERY & ARP COLLECTION ---")
         group_arp_table = {}
         site_subnet_map = {}
@@ -91,23 +92,23 @@ def main():
                 raise Exception(f"Worker script failed for site {site}")
             try:
                 with open(f"{OUTPUT_DIR}{site}/arp_table.yml", 'r') as f:
-                    loaded_yaml = yaml.safe_load(f)
-                    site_arp_data = loaded_yaml.get('arp_table', {})
-                # --- Debugging Print Statements ---
-                # print(f" -> Loaded ARP data for site '{site}'. Type: {type(site_arp_data)}. Items: {len(site_arp_data)}"")
-                # print(f" -> Current group_arp_table type: {type(group_arp_table)}"")
-                # --- End Debugging Print Statements ---
+                    # Comment Here
+                    site_arp_data = yaml.safe_load(f).get('arp_table', {})
+                    # Comment Here
+                    # Comment Here
+                    # Comment Here
+                    # Comment Here
                 # Ensure both are dictionaries before updating
                 if isinstance(site_arp_data, dict) and isinstance(group_arp_table, dict):
                     group_arp_table.update(site_arp_data)
                 else:
                     print(f"  -> ERROR: Type mismatch. Cannot merge ARP data for site '{site}'.")
-                # Load the VLAN/Subnet Info
+                # Load the VLAN/Subnet info
                 with open(f"{OUTPUT_DIR}{site}/discovered_vlans.yml", 'r') as f:
                     site_subnet_map[site] = yaml.safe_load(f).get('vlan_info', {}).get('subnet_list', [])
-            
+
             except FileNotFoundError:
-                print(f"Warning: Could not load discovery output for site {site}. It may be missing from enrichment.")
+                print(f"Warning: Could not load discovery output for site {site}.")
             except Exception as e:
                 print(f"Error: Failed to process output files for site '{site}'. Reason {e}")
         with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix=".json", encoding='utf-8') as tf:
@@ -115,36 +116,44 @@ def main():
             temp_arp_cache_file = tf.name
         os.environ['SAD_GROUP_ARP_CACHE'] = temp_arp_cache_file
         print(f"\nSuccess: Aggregated {len(group_arp_table)} ARP entries and created temporary cache.")
-        # --- 5. Phase 2: Global VTC/Phone Filtering ---
-        print("\n--- CONDUCTOR PHASE 2: GLOBAL VTC/PHONE FILTERING ---")
-        primary_site_name = args.target if args.target in site_subnet_map else sites_to_process[0]
-        primary_site_devices = [dev for dev in all_network_devices if dev.get('site') == primary_site_name]
-        primary_site_seed = shared_utils.find_device_by_role(primary_site_devices, 'discovery_seed')
-        vtc_pattern = shared_utils.generate_vtc_pattern(primary_site_seed['ip']) if primary_site_seed else None
-        if vtc_pattern:
-            global_phone_list = cucm_vtc_tool.get_vtc_devices(services_config['cucm_cluster']['publisher_ip'], creds['cucm_user'], creds['cucm_pass'], vtc_pattern)
-            mac_to_ip_map = {shared_utils.normalize_mac(details['mac_address']): ip for ip, details in group_arp_table.items()}
-            group_phones = [phone for phone in global_phone_list if shared_utils.normalize_mac(phone['device_name']) in mac_to_ip_map]
-            print(f"Success: Filtered global list down to {len(group_phones)} phones belonging to this group.")
+        # --- 5. Conditional Workflow based on --run-mode ---
+        if args.run_mode == 'discovery_only':
+            print("\nRun mode is 'discovery_only'. Processing complete.")
 
-            # --- 6. Phase 3: Delegate Final Enrichment ---
-            print("\n--- CONDUCTOR PHASE 3: LIVE STATUS ENRICHMENT ---")
+        elif args.run_mode == 'backup_configs':
+            print("\n--- CONDUCTOR WORKFLOW: CONFIGURATION BACKUP ---")
             for site in sites_to_process:
-                site_subnets = site_subnet_map.get(site, [])
-                devices_for_this_site = [
-                    phone for phone in group_phones
-                    if shared_utils.is_ip_in_subnets(mac_to_ip_map.get(shared_utils.normalize_mac(phone['device_name'])), site_subnets)
-                ]
-                if devices_for_this_site:
-                    print(f"Delegating {len(devices_for_this_site)} devices to '{site}' for enrichment.")
-                    output_path = f"{OUTPUT_DIR}{site}/devices_to_enrich.yml"
-                    shared_utils.save_data_to_yaml(output_path, devices_for_this_site, 'vtc_devices')
-                    command = ["python", ORCHESTRATOR_SCRIPT, "--site", site, "--phase", "enrichment"]
-                    subprocess.run(command)
-                else:
-                    print(f"No VTC/Phones from the group found in site '{site}'. Skipping enrichment.")
-        else:
-            print(f"Warning: Could not generate VTC pattern. Skipping all VTC/Phone tasks.")
+                print(f"\n-> Delegating config backup for site: {site}")
+                command = ["python", ORCHESTRATOR_SCRIPT, "--site", site, "--phase", "backup_configs"]
+                subprocess.run(command)
+
+        elif args.run_mode == 'full':
+            print("\n--- CONDUCTOR WORKFLOW: FULL VTC/PHONE ENRICHMENT ---")
+            primary_site_name = args.target if args.target in site_subnet_map else sites_to_process[0]
+            primary_site_devices = [dev for dev in all_network_devices if dev.get('site') == primary_site_name]
+            primary_site_seed = shared_utils.find_device_by_role(primary_site_devices, 'discovery_seed')
+            vtc_pattern = shared_utils.generate_vtc_pattern(primary_site_seed['ip']) if primary_site_seed else None
+            if vtc_pattern:
+                global_phone_list = cucm_vtc_tool.get_vtc_devices(services_config['cucm_cluster']['publisher_ip'], creds['cucm_user'], creds['cucm_pass'], vtc_pattern)
+                mac_to_ip_map = {shared_utils.normalize_mac(details['mac_address']): ip for ip, details in group_arp_table.items()}
+                group_phones = [phone for phone in global_phone_list if shared_utils.normalize_mac(phone['device_name']) in mac_to_ip_map]
+                print(f"Success: Filtered global list down to {len(group_phones)} phones belonging to this group.")
+                for site in sites_to_process:
+                    site_subnets = site_subnet_map.get(site, [])
+                    devices_for_this_site = [
+                        phone for phone in group_phones
+                        if shared_utils.is_ip_in_subnets(mac_to_ip_map.get(shared_utils.normalize_mac(phone['device_name'])), site_subnets)
+                    ]
+                    if devices_for_this_site:
+                        print(f"Delegating {len(devices_for_this_site)} devices to '{site}' for enrichment.")
+                        output_path = f"{OUTPUT_DIR}{site}/devices_to_enrich.yml"
+                        shared_utils.save_data_to_yaml(output_path, devices_for_this_site, 'vtc_devices')
+                        command = ["python", ORCHESTRATOR_SCRIPT, "--site", site, "--phase", "enrichment"]
+                        subprocess.run(command)
+                    else:
+                        print(f"No VTC/Phones from the group found in site '{site}'. Skipping enrichment.")
+            else:
+                print(f"Warning: Could not generate VTC pattern. Skipping all VTC/Phone tasks.")
     
     except (FileNotFoundError, InvalidTag, ValueError, yaml.YAMLError, Exception) as e:
         print(f"\nCRITICAL CONDUCTOR ERROR: {e}")
