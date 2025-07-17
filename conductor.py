@@ -92,12 +92,11 @@ def main():
                 raise Exception(f"Worker script failed for site {site}")
             try:
                 with open(f"{OUTPUT_DIR}{site}/arp_table.yml", 'r') as f:
-                    # Comment Here
                     site_arp_data = yaml.safe_load(f).get('arp_table', {})
-                    # Comment Here
-                    # Comment Here
-                    # Comment Here
-                    # Comment Here
+                    # --- Debugging Print Statements ---
+                    # print(f"  -> Loaded ARP data for site '{site}'. Type: {type(site_arp_data)}. Items: {len(site_arp_data)}")
+                    # print(f"  -> Current group_arp_table type: {type(group_arp_table})")
+                    # --- End of Debugging Print Statements ---
                 # Ensure both are dictionaries before updating
                 if isinstance(site_arp_data, dict) and isinstance(group_arp_table, dict):
                     group_arp_table.update(site_arp_data)
