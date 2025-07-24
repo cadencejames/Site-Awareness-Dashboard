@@ -9,11 +9,11 @@ from tools import cisco_arp_tool, cisco_cdp_tool, cisco_config_tool, cisco_vlan_
 # --- Configuration ---
 CONFIG_DIR = "./configs/"
 OUTPUT_DIR = "./output/"
-DISCOVERY_EXCLUSION_PATTERNS = ["SEP*", "*spine*", "*leaf*"]
+DISCOVERY_EXCLUSION_PATTERNS = ['SEP*', "*spine*", "*leaf*"]
 
 # --- Main Phase Functions ---
-def do_discovery_and_arp_phases(site_name, site_seed_device, creds, mgmt_overrides):
-    # Phase 1: Discovery topology and collect all ARP data for a single site.
+def do_discovery_and_arp_phase(site_name, site_seed_device, creds, mgmt_override):
+    # Phase 1: Discovery topology and collect all ARP data for a single site
     print(f"--- Starting Discovery & ARP Phase for site: {site_name} ---")
     output_dir = f"{OUTPUT_DIR}{site_name}/"
     os.makedirs(output_dir, exist_ok=True)
@@ -22,7 +22,7 @@ def do_discovery_and_arp_phases(site_name, site_seed_device, creds, mgmt_overrid
     if not site_subnets:
         print("Critical Error: No subnets discovered. Aborting.")
         return False
-    shared_utils.save_data_to_yaml(f"{output_dir}discovered_vlans.yml", subnet_info, 'vlan_info')
+    shared_utils.save_data_to_yaml(f"{output_dir}discoverd_vlans.yml", subnet_info, 'vlan_info')
 
     standardized_seed = {'device_name': site_seed_device.get('device_name', site_seed_device['ip']), 'ip': site_seed_device['ip'], 'type': site_seed_device.get('type', 'cisco_ios')}
     devices_to_scan = [standardized_seed]
@@ -40,10 +40,10 @@ def do_discovery_and_arp_phases(site_name, site_seed_device, creds, mgmt_overrid
                 discovered_by_name[current_device['device_name']] = current_ip
         if neighbors is None:
             continue
-        
+
         for neighbor in neighbors:
             neighbor_name = neighbor.get('device_name', '')
-            override_info = mgmt_overrides.get(neighbor_name)
+            override_info = mgmt_override.get(neighbor_name)
             neighbor_ip = override_info.get('management_ip') if override_info else neighbor.get('ip_address')
             if shared_utils.is_excluded(neighbor_name, DISCOVERY_EXCLUSION_PATTERNS):
                 continue
@@ -53,14 +53,14 @@ def do_discovery_and_arp_phases(site_name, site_seed_device, creds, mgmt_overrid
             devices_to_scan.append(standardized_neighbor)
             discovered_topology[neighbor_ip] = standardized_neighbor
             discovered_by_name[neighbor_name] = neighbor_ip
-    shared_utils.save_data_to_yaml(f"{output_dir}discovered_topology.yml", list(discovered_topology.values()), 'devices')
+    shared_utils.save_data_to_yaml(f"{output_dir}discovered_topology.yml", list(discovered_topology.values()), "devices")
 
     full_arp_table = {}
     for device in discovered_topology.values():
         arp_data = cisco_arp_tool.get_cisco_arp_dict(device, creds['net_user'], creds['net_pass'])
         if arp_data:
             full_arp_table.update(arp_data)
-    shared_utils.save_data_to_yaml(f"{output_dir}arp_table.yml", full_arp_table, 'arp_table')
+    shared_utils.save_data_to_yaml(f"{output_dir}arp_table.yml", full_arp_table, "arp_table")
     return True
 
 def do_enrichment_phase(site_name, creds):
@@ -96,18 +96,18 @@ def do_enrichment_phase(site_name, creds):
         else:
             device['ip_address'] = "NOT_FOUND_IN_GROUP_ARP"
         enriched_list.append(device)
-    shared_utils.save_data_to_yaml(f"{output_dir}vtc_devices_enriched.yml", enriched_list, 'vtc_devices')
+    shared_utils.save_data_to_yaml(F"{output_dir}vtc_devices_enriched.yml", enriched_list, 'vtc_devices')
     return True
 
 def do_config_backup_phase(site_name, creds):
-    # Phase 3: Backs up the running configuration for all discovered devices at a specific site, archiving old configs if changes are detected.
+    # Phase 3: Backs up the running config for all discovered devices at a site
     print(f"--- Starting Configuration Backup Phase for site: {site_name} ---")
-    # Define paths
+    # Define Paths
     site_output_dir = f"{OUTPUT_DIR}{site_name}/"
     config_backup_dir = f"{site_output_dir}configs/"
     archive_dir = f"{config_backup_dir}archive/"
     os.makedirs(archive_dir, exist_ok=True)
-    
+
     # This phase depends on the discovery phase having run first
     try:
         with open(f"{site_output_dir}discovered_topology.yml", 'r') as f:
@@ -120,7 +120,7 @@ def do_config_backup_phase(site_name, creds):
         if not device_name:
             continue
         print(f"  -> Processing config for: {device_name}")
-        
+
         # Get the new config and its hash
         new_config, new_hash = cisco_config_tool.get_config_and_hash(device, creds['net_user'], creds['net_pass'])
         if not new_config:
@@ -128,18 +128,18 @@ def do_config_backup_phase(site_name, creds):
             continue
         current_config_path = f"{config_backup_dir}{device_name}.txt"
         old_hash = ""
-        
+
         # Try to read the old config file to get its hash
         if os.path.exists(current_config_path):
             with open(current_config_path, 'r') as f:
                 old_config = f.read()
                 old_hash = cisco_config_tool.calculate_md5(old_config)
-        
+
         # Compare hashes
         if new_hash == old_hash:
             print(f"    - No changes detected for {device_name}.")
         else:
-            print(f"    - CHANGE DETECTED for {device_name}. Backing up new config.")
+            print(f"    - CHANGE DETECTED for {device_name}. Backup up new config.")
             # If an old file exists, move it to the archive
             if os.path.exists(current_config_path):
                 import datetime
@@ -178,22 +178,22 @@ if __name__ == "__main__":
     site_device_config = [dev for dev in all_network_devices if dev.get('site') == args.site]
     if not site_device_config:
         print(f"Worker Error: No devices found for site '{args.site}' in network_devices.yml")
-    
+
     success = False
     if args.phase == 'discovery_and_arp':
         seed_device = shared_utils.find_device_by_role(site_device_config, 'discovery_seed')
         if not seed_device:
             print(f"Worker Error: No 'discovery_seed' device found for site '{args.site}'.")
             exit(1)
-        success = do_discovery_and_arp_phases(args.site, seed_device, creds, mgmt_overrides)
+        success = do_discovery_and_arp_phase(args.site, seed_device, creds, mgmt_overrides)
     elif args.phase == 'enrichment':
         success = do_enrichment_phase(args.site, creds)
     elif args.phase == 'backup_configs':
-        success = do_config_backup(args.site, creds)
+        success = do_config_backup_phase(args.site, creds)
     
     if not success:
         print(f"Worker for site '{args.site}' phase '{args.phase}' failed.")
         exit(1)
     else:
-        print(f"Worker for site '{args.site}' phase '{args.phase}' completed successfully.")
+        print(f"Worker for site '{args.site}' phase '{args.phase}' completed succesfully.")
         exit(0)
