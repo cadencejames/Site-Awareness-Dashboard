@@ -1,0 +1,8 @@
+sad.db
+credentials*.enc
+write_queue/
+logs/
+session_logs/
+dashboard/
+__pycache__/
+*.pyc
