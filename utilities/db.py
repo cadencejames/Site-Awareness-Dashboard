@@ -55,7 +55,8 @@ CREATE TABLE IF NOT EXISTS sites (
     last_run           TEXT,  -- legacy, frozen - see last_cdp_discovery
     last_cdp_discovery TEXT,  -- set only by mark_site_run(); the trustworthy "was this site actually scanned" signal
     last_arp_collection TEXT,  -- set only by mark_site_arp_run(); same idea as last_cdp_discovery, for ARP collection
-    last_mac_table_collection TEXT  -- set only by mark_site_mac_table_run(); same idea again, for MAC-table/client collection specifically. NOT the same as last_cdp_discovery, which advances on every CDP walk regardless of whether MAC-table collection was actually requested that run - client staleness needs its own timestamp to avoid every client looking newly stale after a plain CDP-only re-scan
+    last_mac_table_collection TEXT,  -- set only by mark_site_mac_table_run(); same idea again, for MAC-table/client collection specifically. NOT the same as last_cdp_discovery, which advances on every CDP walk regardless of whether MAC-table collection was actually requested that run - client staleness needs its own timestamp to avoid every client looking newly stale after a plain CDP-only re-scan
+    last_tunnel_collection TEXT  -- set only by mark_site_tunnel_run(); same idea again, for tunnel collection specifically - see mark_site_tunnel_run()'s docstring for how this differs from tunnel_links.last_confirmed
 );
 
 CREATE TABLE IF NOT EXISTS devices (
@@ -217,11 +218,84 @@ CREATE TABLE IF NOT EXISTS device_ips (
     UNIQUE(device_id, ip)
 );
 
+-- Raw per-device tunnel interface data, collected via 'show
+-- interfaces tunnel <N>' (see tunnel_parser.py), starting from each
+-- site's CDP seed outward like everything else - NOT limited to
+-- devices already known from a CDP neighbor relationship, since a
+-- tunnel's far end reaches sites CDP can never see across (an
+-- internet-routed GRE tunnel, invisible to CDP by design; confirmed
+-- CDP does not run on these interfaces at all in this environment).
+-- One row per device per tunnel interface; a later collection for the
+-- same device/interface REPLACES the previous row - same "last
+-- processed wins" pattern as device_ips/arp_entries.
+--
+-- source_ip/destination_ip are the fields match_tunnels() actually
+-- joins on to build tunnel_links. description/internet_address are
+-- captured for reference/display only (the per-site Tunnels panel) -
+-- neither is used for matching. Any of the parsed fields can be NULL
+-- (an interface whose source/destination line didn't parse, or that
+-- has no description/address configured) - see tunnel_parser.py,
+-- which deliberately still returns a row in that case rather than
+-- dropping it, so it can show up here too instead of vanishing.
+CREATE TABLE IF NOT EXISTS tunnel_interfaces (
+    id                     INTEGER PRIMARY KEY AUTOINCREMENT,
+    site_id                INTEGER NOT NULL REFERENCES sites(id),
+    device_id              INTEGER NOT NULL REFERENCES devices(id),
+    interface              TEXT NOT NULL,
+    admin_status           TEXT,
+    line_protocol          TEXT,
+    description            TEXT,
+    internet_address       TEXT,
+    source_ip              TEXT,
+    source_interface       TEXT,
+    destination_ip         TEXT,
+    destination_interface  TEXT,
+    last_seen              TEXT,
+    raw_source_data        TEXT,
+    UNIQUE(device_id, interface)
+);
+
+-- Resolved tunnel pairings, built by match_tunnels(). One row per
+-- LOCAL tunnel interface (device_a), NOT one row per pair - a
+-- genuinely matched pair therefore shows up as TWO rows, one from
+-- each device's own perspective (device_a's row points at device_b,
+-- and device_b's own separate row independently points back at
+-- device_a), which mirrors how the two devices were independently
+-- scanned in the first place and lets a per-site Tunnels panel just
+-- query "WHERE device_a_id IN (this site's devices)" without caring
+-- which side "owns" the pairing.
+--
+-- device_b_id/device_b_interface are NULL whenever no matching
+-- reverse row exists yet (the far site hasn't been scanned yet, or
+-- the tunnel really has been removed on that end) - deliberately
+-- surfaced as a one-sided row rather than hidden, since that's itself
+-- useful signal (possible config drift: configured on one end,
+-- deleted on the other).
+--
+-- last_confirmed is its own staleness signal, separate from either
+-- endpoint device's last_seen - a tunnel (especially a backup one)
+-- can flap independently of the device itself staying reachable.
+CREATE TABLE IF NOT EXISTS tunnel_links (
+    id                     INTEGER PRIMARY KEY AUTOINCREMENT,
+    device_a_id            INTEGER NOT NULL REFERENCES devices(id),
+    device_a_interface     TEXT NOT NULL,
+    device_b_id            INTEGER REFERENCES devices(id),
+    device_b_interface     TEXT,
+    source_ip              TEXT NOT NULL,
+    destination_ip         TEXT NOT NULL,
+    last_confirmed         TEXT,
+    UNIQUE(device_a_id, device_a_interface)
+);
+
 CREATE INDEX IF NOT EXISTS idx_devices_site   ON devices(site_id);
 CREATE INDEX IF NOT EXISTS idx_devices_serial ON devices(serial_number);
 CREATE INDEX IF NOT EXISTS idx_links_site     ON links(site_id);
 CREATE INDEX IF NOT EXISTS idx_arp_site       ON arp_entries(site_id);
 CREATE INDEX IF NOT EXISTS idx_device_ips_device ON device_ips(device_id);
+CREATE INDEX IF NOT EXISTS idx_tunnel_interfaces_site   ON tunnel_interfaces(site_id);
+CREATE INDEX IF NOT EXISTS idx_tunnel_interfaces_device ON tunnel_interfaces(device_id);
+CREATE INDEX IF NOT EXISTS idx_tunnel_links_device_a    ON tunnel_links(device_a_id);
+CREATE INDEX IF NOT EXISTS idx_tunnel_links_device_b    ON tunnel_links(device_b_id);
 """
 
 
@@ -348,6 +422,7 @@ def init_db(db_path: str = DB_PATH) -> None:
         # case any real database predates it and was never recreated
         # from scratch since (this call is a safe no-op otherwise).
         _ensure_column(conn, "devices", "marked_stale_at", "TEXT")
+        _ensure_column(conn, "sites", "last_tunnel_collection", "TEXT")
 
 
 # ---------------------------------------------------------------------
@@ -622,6 +697,22 @@ def mark_site_mac_table_run(conn, site_id: int) -> None:
     though nothing about them was actually re-verified that time.
     """
     conn.execute("UPDATE sites SET last_mac_table_collection = ? WHERE id = ?", (_now(), site_id))
+
+
+def mark_site_tunnel_run(conn, site_id: int) -> None:
+    """Stamp a site's last_tunnel_collection to now (call at the end of
+    a successful collect_tunnels() run) - same idea as mark_site_run()/
+    mark_site_arp_run()/mark_site_mac_table_run(), its own separate
+    column for the same reason last_mac_table_collection is separate
+    from last_cdp_discovery: this only advances when tunnel collection
+    itself actually ran, not on every unrelated CDP walk. This is
+    site-level "was this site's tunnel data ever collected at all"
+    staleness - a DIFFERENT, more granular signal than
+    tunnel_links.last_confirmed, which tracks each individual tunnel
+    pairing's own freshness (a backup tunnel can go stale on its own
+    without the whole site's collection being stale).
+    """
+    conn.execute("UPDATE sites SET last_tunnel_collection = ? WHERE id = ?", (_now(), site_id))
 
 
 # ---------------------------------------------------------------------
@@ -1532,6 +1623,223 @@ def delete_device(conn, device_id: int) -> None:
     foreign keys are enforced, so this raises if child rows remain.
     """
     conn.execute("DELETE FROM devices WHERE id = ?", (device_id,))
+
+
+# ---------------------------------------------------------------------
+# Tunnel interfaces / tunnel links
+# ---------------------------------------------------------------------
+
+def upsert_tunnel_interface(
+    conn,
+    site_id: int,
+    device_id: int,
+    interface: str,
+    admin_status: str = None,
+    line_protocol: str = None,
+    description: str = None,
+    internet_address: str = None,
+    source_ip: str = None,
+    source_interface: str = None,
+    destination_ip: str = None,
+    destination_interface: str = None,
+    raw_source_data: str = None,
+) -> int:
+    """Insert or refresh a device's tunnel interface row (see
+    tunnel_parser.py for how these fields are extracted from 'show
+    interfaces tunnel <N>' output). One row per device per interface;
+    a later collection REPLACES the previous row - same "last
+    processed wins" pattern as device_ips/arp_entries.
+
+    source_ip/destination_ip are the fields match_tunnels() actually
+    joins on; everything else here is for display/reference only.
+    Either can legitimately be None (see tunnel_interfaces' own schema
+    comment) - a row like that still gets stored, it just can never be
+    matched until/unless it's corrected on a later collection.
+    """
+    conn.execute(
+        """
+        INSERT INTO tunnel_interfaces (
+            site_id, device_id, interface, admin_status, line_protocol,
+            description, internet_address, source_ip, source_interface,
+            destination_ip, destination_interface, last_seen, raw_source_data
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(device_id, interface) DO UPDATE SET
+            site_id                = excluded.site_id,
+            admin_status           = excluded.admin_status,
+            line_protocol          = excluded.line_protocol,
+            description            = excluded.description,
+            internet_address       = excluded.internet_address,
+            source_ip              = excluded.source_ip,
+            source_interface       = excluded.source_interface,
+            destination_ip         = excluded.destination_ip,
+            destination_interface  = excluded.destination_interface,
+            last_seen              = excluded.last_seen,
+            raw_source_data        = excluded.raw_source_data
+        """,
+        (site_id, device_id, interface, admin_status, line_protocol,
+         description, internet_address, source_ip, source_interface,
+         destination_ip, destination_interface, _now(), raw_source_data),
+    )
+    row = conn.execute(
+        "SELECT id FROM tunnel_interfaces WHERE device_id = ? AND interface = ?",
+        (device_id, interface),
+    ).fetchone()
+    return row["id"]
+
+
+def get_tunnel_interfaces_for_site(conn, site_id: int):
+    """Every raw tunnel_interfaces row for this site's own devices -
+    the source data for a per-site Tunnels panel, unfiltered by
+    whether source_ip/destination_ip parsed or matched anything."""
+    return conn.execute(
+        """
+        SELECT tunnel_interfaces.*, devices.hostname AS device_hostname
+        FROM tunnel_interfaces
+        JOIN devices ON tunnel_interfaces.device_id = devices.id
+        WHERE tunnel_interfaces.site_id = ? AND devices.deleted_at IS NULL
+        """,
+        (site_id,),
+    ).fetchall()
+
+
+def get_all_tunnel_interfaces(conn):
+    """Every tunnel_interfaces row that has BOTH source_ip and
+    destination_ip - the only rows match_tunnels() can do anything
+    with. A row missing one or both (its 'Tunnel source ...,
+    destination ...' line didn't parse) is excluded here, not deleted
+    - it still shows up in a site's raw tunnel list via
+    get_tunnel_interfaces_for_site(), just never as a match candidate.
+    """
+    return conn.execute(
+        "SELECT * FROM tunnel_interfaces WHERE source_ip IS NOT NULL AND destination_ip IS NOT NULL"
+    ).fetchall()
+
+
+def match_tunnels(conn) -> dict:
+    """Global correlation pass: for every tunnel_interfaces row with a
+    parsed source_ip/destination_ip, look for the mirror-image row
+    from a DIFFERENT device (its source_ip/destination_ip swapped
+    relative to this one) and record the pairing in tunnel_links.
+    Deliberately global rather than per-site - a tunnel's far end is
+    very often at a different site than the one just scanned, so this
+    has to search the WHOLE tunnel_interfaces table, not just whatever
+    site triggered the collection.
+
+    Every eligible tunnel_interfaces row gets its own tunnel_links row
+    (as device_a), whether or not a match was found - see
+    tunnel_links' own schema comment for why a genuine pair ends up as
+    two rows, one from each side, and why a one-sided tunnel is
+    deliberately surfaced (device_b_id/device_b_interface left NULL)
+    rather than hidden.
+
+    Ambiguous cases (more than one row claims the exact same reverse
+    source/destination pair - a real misconfiguration, not expected in
+    normal operation) are left one-sided rather than guessed at, and
+    counted separately so a caller can report them rather than the
+    mismatch going unnoticed.
+
+    Meant to be re-run after every tunnel collection (whether one site
+    or the whole fleet) - existing tunnel_links rows are refreshed in
+    place via upsert, not accumulated as history.
+
+    Returns {"matched": N, "one_sided": N, "ambiguous": N} counts.
+    """
+    all_rows = get_all_tunnel_interfaces(conn)
+
+    matched = 0
+    one_sided = 0
+    ambiguous = 0
+
+    for row in all_rows:
+        candidates = [
+            other for other in all_rows
+            if other["id"] != row["id"]
+            and other["device_id"] != row["device_id"]
+            and other["source_ip"] == row["destination_ip"]
+            and other["destination_ip"] == row["source_ip"]
+        ]
+
+        if len(candidates) == 1:
+            match = candidates[0]
+            device_b_id = match["device_id"]
+            device_b_interface = match["interface"]
+            matched += 1
+        else:
+            device_b_id = None
+            device_b_interface = None
+            if len(candidates) == 0:
+                one_sided += 1
+            else:
+                ambiguous += 1
+
+        conn.execute(
+            """
+            INSERT INTO tunnel_links (
+                device_a_id, device_a_interface, device_b_id, device_b_interface,
+                source_ip, destination_ip, last_confirmed
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(device_a_id, device_a_interface) DO UPDATE SET
+                device_b_id        = excluded.device_b_id,
+                device_b_interface = excluded.device_b_interface,
+                source_ip          = excluded.source_ip,
+                destination_ip     = excluded.destination_ip,
+                last_confirmed     = excluded.last_confirmed
+            """,
+            (row["device_id"], row["interface"], device_b_id, device_b_interface,
+             row["source_ip"], row["destination_ip"], _now()),
+        )
+
+    return {"matched": matched, "one_sided": one_sided, "ambiguous": ambiguous}
+
+
+def get_tunnel_links_for_site(conn, site_id: int):
+    """tunnel_links rows for this site's own devices (as device_a) -
+    each row is one local tunnel interface and, if matched, who it
+    pairs with. See tunnel_links' schema comment for why a genuine
+    pair shows up as two independent rows rather than one shared row -
+    this only returns this site's own half of any such pair; the far
+    site's page shows its own row independently.
+    """
+    return conn.execute(
+        """
+        SELECT tunnel_links.*,
+               da.hostname AS device_a_hostname,
+               dbb.hostname AS device_b_hostname,
+               dbb.site_id AS device_b_site_id,
+               sb.site_name AS device_b_site_name,
+               sb.site_octet AS device_b_site_octet
+        FROM tunnel_links
+        JOIN devices da ON tunnel_links.device_a_id = da.id
+        LEFT JOIN devices dbb ON tunnel_links.device_b_id = dbb.id
+        LEFT JOIN sites sb ON dbb.site_id = sb.id
+        WHERE da.site_id = ? AND da.deleted_at IS NULL
+        """,
+        (site_id,),
+    ).fetchall()
+
+
+def get_all_tunnel_links(conn):
+    """Every tunnel_links row with both sides' hostname/site resolved
+    (device_b's side left NULL for one-sided rows) - the source data
+    for the all-site tunnel diagram.
+    """
+    return conn.execute(
+        """
+        SELECT tunnel_links.*,
+               da.hostname AS device_a_hostname, da.site_id AS device_a_site_id,
+               sa.site_name AS device_a_site_name, sa.site_octet AS device_a_site_octet,
+               dbb.hostname AS device_b_hostname, dbb.site_id AS device_b_site_id,
+               sb.site_name AS device_b_site_name, sb.site_octet AS device_b_site_octet
+        FROM tunnel_links
+        JOIN devices da ON tunnel_links.device_a_id = da.id
+        JOIN sites sa ON da.site_id = sa.id
+        LEFT JOIN devices dbb ON tunnel_links.device_b_id = dbb.id
+        LEFT JOIN sites sb ON dbb.site_id = sb.id
+        WHERE da.deleted_at IS NULL
+        """
+    ).fetchall()
 
 
 if __name__ == "__main__":

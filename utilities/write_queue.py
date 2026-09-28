@@ -134,14 +134,6 @@ ACTIONS = {
     "set_device_arp_override_ip": db.set_device_arp_override_ip,
     "set_device_marked_stale": db.set_device_marked_stale,
     "auto_seed_singleton_sites": db.auto_seed_singleton_sites,
-
-    # Raw discovery-time write functions. Unlike the actions above,
-    # none of these call db.log_activity() internally - a multi-site
-    # scan can touch thousands of devices/links/ARP entries, and
-    # logging every single one would flood the activity log with noise
-    # nobody wants to read. The one activity_log entry for an entire
-    # scan is written up front by run_for_sites() itself, independently
-    # of the queue.
     "upsert_device": db.upsert_device,
     "record_device_ip": db.record_device_ip,
     "upsert_link": db.upsert_link,
@@ -152,6 +144,9 @@ ACTIONS = {
     "upsert_arp_entry": db.upsert_arp_entry,
     "mark_site_arp_run": db.mark_site_arp_run,
     "get_or_create_unassigned_site": db.get_or_create_unassigned_site,
+    "upsert_tunnel_interface": db.upsert_tunnel_interface,
+    "mark_site_tunnel_run": db.mark_site_tunnel_run,
+    "match_tunnels": db.match_tunnels,
 }
 
 

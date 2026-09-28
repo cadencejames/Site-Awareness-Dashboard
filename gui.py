@@ -10,13 +10,13 @@ Command Runner (preview/commit a plugin's changes against one site or
 all of them), and Credentials (unlock status and store maintenance).
 
 Discovery deliberately reuses orchestrator.py's run_for_sites()/
-discover_site()/collect_arp() directly rather than reimplementing any
-of that logic - this GUI is purely a scope/action picker, a background
-thread so the window doesn't freeze during a multi-minute run, and a
-console panel plus worker-status display that reflect those functions'
-existing print() output and progress_cb callbacks. There is exactly
-one implementation of the actual discovery logic (orchestrator.py),
-not two.
+discover_site()/collect_arp()/collect_tunnels() directly rather than
+reimplementing any of that logic - this GUI is purely a scope/action
+picker, a background thread so the window doesn't freeze during a
+multi-minute run, and a console panel plus worker-status display that
+reflect those functions' existing print() output and progress_cb
+callbacks. There is exactly one implementation of the actual discovery
+logic (orchestrator.py), not two.
 
 Run from the project root:
     python3 gui.py
@@ -1045,8 +1045,9 @@ class LoginDialog(tk.Toplevel):
 
 
 class DiscoveryTab(ttk.Frame):
-    """GUI over orchestrator.py's CDP/ARP collection. Scope (one site
-    or all) and action (cdp/arp/both) pickers up top, a Run button, an
+    """GUI over orchestrator.py's CDP/ARP/tunnel collection. Scope (one
+    site or all) and action (cdp/arp/both) pickers up top, opt-in
+    checkboxes for MAC-table and tunnel collection, a Run button, an
     overall progress bar, one status column per active worker thread
     (color-coded by phase, with a hover tooltip for the full detail
     text and a highlighted border if a worker's had no update in a
@@ -1105,6 +1106,19 @@ class DiscoveryTab(ttk.Frame):
             variable=self.collect_mac_var,
         )
         self.collect_mac_check.grid(row=2, column=1, columnspan=4, sticky="w", pady=(4, 0))
+
+        # Unlike the MAC-table checkbox, this doesn't piggyback on the
+        # CDP walk - it's its own connection to just the site's CDP
+        # seed device (see orchestrator.collect_tunnels()'s docstring),
+        # so it's meaningful alongside cdp OR arp, not gated to cdp
+        # specifically. Not relevant to "Generate dashboard" (no
+        # network connection at all) - see _on_action_changed().
+        self.collect_tunnels_var = tk.BooleanVar(value=False)
+        self.collect_tunnels_check = ttk.Checkbutton(
+            controls, text="Also collect tunnel interfaces (uses each site's CDP seed device)",
+            variable=self.collect_tunnels_var,
+        )
+        self.collect_tunnels_check.grid(row=3, column=1, columnspan=4, sticky="w", pady=(4, 0))
 
         self.run_button = ttk.Button(controls, text="Run", command=self._on_run_clicked)
         self.run_button.grid(row=0, column=5, rowspan=2, sticky="ns", padx=(20, 0))
@@ -1165,6 +1179,14 @@ class DiscoveryTab(ttk.Frame):
         # meaningful when CDP is actually part of what's about to run.
         collect_mac_relevant = self.action_var.get() in ("cdp", "all")
         self.collect_mac_check.configure(state="normal" if collect_mac_relevant else "disabled")
+
+        # Tunnel collection doesn't piggyback on anything - it's its
+        # own connection to the CDP seed (see
+        # orchestrator.collect_tunnels()), so it's relevant for any
+        # action that actually touches the network. Only "Generate
+        # dashboard" (no network connection at all) disables it.
+        collect_tunnels_relevant = self.action_var.get() in ("cdp", "arp", "all")
+        self.collect_tunnels_check.configure(state="normal" if collect_tunnels_relevant else "disabled")
 
     def _refresh_site_choices(self):
         with db.get_conn() as conn:
@@ -1373,7 +1395,8 @@ class DiscoveryTab(ttk.Frame):
         else:
             actions = ["cdp", "arp"] if action == "all" else [action]
             collect_mac_tables = self.collect_mac_var.get() and action in ("cdp", "all")
-            worker_target, worker_args = self._run_worker, (site_id, actions, creds, collect_mac_tables)
+            collect_tunnels_flag = self.collect_tunnels_var.get() and action in ("cdp", "arp", "all")
+            worker_target, worker_args = self._run_worker, (site_id, actions, creds, collect_mac_tables, collect_tunnels_flag)
 
         self._worker_thread = threading.Thread(target=worker_target, args=worker_args, daemon=True)
         self._worker_thread.start()
@@ -1413,7 +1436,7 @@ class DiscoveryTab(ttk.Frame):
             sys.stdout = original_stdout
             self._output_queue.put(_DONE)
 
-    def _run_worker(self, site_id, actions, creds, collect_mac_tables=False):
+    def _run_worker(self, site_id, actions, creds, collect_mac_tables=False, collect_tunnels_flag=False):
         original_stdout = sys.stdout
         sys.stdout = _QueueWriter(self._output_queue)
         try:
@@ -1456,6 +1479,7 @@ class DiscoveryTab(ttk.Frame):
                 # for the whole scan.
                 orchestrator.run_for_sites(
                     sites, actions, creds, collect_mac_tables=collect_mac_tables,
+                    collect_tunnels_flag=collect_tunnels_flag,
                     progress_cb=self._on_discovery_progress,
                 )
         except Exception as e:

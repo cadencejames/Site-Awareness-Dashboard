@@ -46,6 +46,7 @@ import cdp_parser  # noqa: E402
 import arp_parser  # noqa: E402
 import vrf_parser  # noqa: E402
 import mac_parser  # noqa: E402
+import tunnel_parser  # noqa: E402
 
 
 # How many sites run_for_sites() will scan at once. Bounded rather than
@@ -974,13 +975,133 @@ def collect_arp(site_row, creds: dict, open_session_fn=None, session_log_dir: st
     _report_progress(progress_cb, "status", octet, slot, "arp", f"ARP collection complete: {total_entries} entry(ies) total")
 
 
+def collect_tunnels(site_row, creds: dict, open_session_fn=None, session_log_dir: str = None, progress_cb=None,
+                     slot=None) -> None:
+    """Connect to a site's CDP seed device ONLY (not every device the
+    CDP walk reaches - tunnels terminate on a site's edge/WAN router,
+    not on every switch in the site), enumerate its tunnel interfaces
+    via 'show interfaces description', pull 'show interfaces <name>'
+    for each one, and write the parsed result into tunnel_interfaces.
+    Finishes by re-running match_tunnels() - see that function's own
+    docstring for why the correlation pass is global rather than
+    scoped to this one site's data alone.
+
+    Deliberately its own independent connection/action, structured
+    just like collect_arp() (not piggybacked onto discover_site()'s
+    CDP walk the way collect_mac_tables is) - it only ever needs ONE
+    device's session, so there's no BFS walk here for it to ride along
+    with. This also means, like collect_arp(), it doesn't require
+    'cdp' to be part of THIS run's actions - only that a CDP seed is
+    already flagged for this site from some earlier run.
+
+    open_session_fn(ip_candidates, username, password, platform_hint)
+    -> (session, used_ip), same contract as collect_arp() - defaults
+    to the real open_session() (live Netmiko); tests pass a fake.
+
+    A device whose 'show interfaces description' has no "Tu..." rows
+    at all (no tunnels configured) is a normal, silent no-op here, not
+    an error or a warning - most sites won't have any.
+    """
+    if open_session_fn is None:
+        def open_session_fn(ip_candidates, username, password, platform_hint=None):
+            return open_session(
+                ip_candidates, username, password, platform_hint=platform_hint, session_log_dir=session_log_dir,
+            )
+    username, password = _get_tacacs_credentials(creds)
+    octet = site_row["site_octet"]
+
+    with db.get_conn() as conn:
+        seed = db.get_seed_device_for_site(conn, site_row["id"])
+    if seed is None:
+        print(f"  Skipping site {site_row['site_octet']} - no CDP seed device flagged.")
+        _report_progress(progress_cb, "status", octet, slot, "skipped", "Skipped - no CDP seed device flagged")
+        return
+
+    with db.get_conn() as conn:
+        ip_candidates = db.get_ips_for_device(conn, seed["id"])
+    if not ip_candidates:
+        print(f"  No known IP for seed {seed['hostname']} - skipping tunnel collection.")
+        _report_progress(
+            progress_cb, "status", octet, slot, "skipped",
+            f"Skipped - no known IP for seed {seed['hostname']}",
+        )
+        return
+
+    print(f"  Connecting to {seed['hostname']} for tunnel collection...", flush=True)
+    _report_progress(progress_cb, "status", octet, slot, "tunnels", f"Connecting to {seed['hostname']}...")
+    try:
+        session, used_ip = open_session_fn(ip_candidates, username, password, seed["platform"])
+    except Exception as e:
+        print(f"    Could not connect to {seed['hostname']} (tried {ip_candidates}): {e}")
+        _report_progress(
+            progress_cb, "status", octet, slot, "tunnels", f"Could not connect to {seed['hostname']}: {e}",
+        )
+        return
+
+    # Same reasoning as collect_arp()/discover_site()'s batching: no
+    # read-after-write dependency between any of these, so they
+    # collect in memory and go out as one batch after the session
+    # closes rather than one round trip per tunnel interface.
+    tunnel_ops = []
+    tunnel_names = []
+    try:
+        desc_raw = session.run("show interfaces description")
+        tunnel_names = tunnel_parser.parse_tunnel_interface_names(desc_raw)
+        if tunnel_names:
+            print(f"    Found {len(tunnel_names)} tunnel interface(s): {tunnel_names}", flush=True)
+        else:
+            print("    No tunnel interfaces found.", flush=True)
+        _report_progress(
+            progress_cb, "status", octet, slot, "tunnels",
+            f"Found {len(tunnel_names)} tunnel interface(s)" if tunnel_names else "No tunnel interfaces found",
+        )
+
+        for name in tunnel_names:
+            detail_raw = session.run(f"show interfaces {name}")
+            for entry in tunnel_parser.parse_tunnel_interfaces(detail_raw):
+                tunnel_ops.append({
+                    "action": "upsert_tunnel_interface",
+                    "kwargs": {
+                        "site_id": site_row["id"], "device_id": seed["id"], "interface": entry["interface"],
+                        "admin_status": entry["admin_status"], "line_protocol": entry["line_protocol"],
+                        "description": entry["description"], "internet_address": entry["internet_address"],
+                        "source_ip": entry["source_ip"], "source_interface": entry["source_interface"],
+                        "destination_ip": entry["destination_ip"], "destination_interface": entry["destination_interface"],
+                        "raw_source_data": entry["raw_line"],
+                    },
+                })
+    finally:
+        session.close()
+
+    tunnel_ops.append({"action": "mark_site_tunnel_run", "kwargs": {"site_id": site_row["id"]}})
+    write_queue.queue_batch_and_wait(tunnel_ops)
+
+    # Global, not site-scoped - see match_tunnels()'s own docstring.
+    # Re-run after every site's tunnel collection rather than only
+    # once at the very end of a multi-site run: cheap (a full fleet's
+    # worth of tunnel rows is nowhere near arp_entries-scale), always
+    # idempotent, and means a run against just one site still leaves
+    # every OTHER site's already-collected tunnels correctly
+    # re-matched against this site's fresh data too.
+    result = write_queue.queue_and_wait("match_tunnels")
+    print(f"  Site {site_row['site_octet']}: recorded {len(tunnel_names)} tunnel interface(s) via {used_ip}; "
+          f"global match: {result['matched']} matched, {result['one_sided']} one-sided, {result['ambiguous']} ambiguous.")
+    _report_progress(
+        progress_cb, "status", octet, slot, "tunnels",
+        f"Tunnel collection complete: {len(tunnel_names)} interface(s); "
+        f"{result['matched']} matched / {result['one_sided']} one-sided / {result['ambiguous']} ambiguous fleet-wide",
+    )
+
+
 def _run_site_actions(site, actions: list, creds: dict, session_log_dir: str = None,
-                       collect_mac_tables: bool = False, progress_cb=None, worker_slots=None) -> None:
+                       collect_mac_tables: bool = False, collect_tunnels_flag: bool = False,
+                       progress_cb=None, worker_slots=None) -> None:
     """One site's worth of work, pulled out into its own function so it
     can be handed to a thread-pool worker as-is. A site's own actions
     always run in the same strict order (CDP walk, then MAC
-    correlation, then ARP) - only which SITES run concurrently with
-    each other is parallelized, not the order of work within one site.
+    correlation, then ARP, then tunnels) - only which SITES run
+    concurrently with each other is parallelized, not the order of
+    work within one site.
 
     This is the function that actually executes ON a pool worker
     thread, so it's the right (and only) place to ask "which worker
@@ -989,6 +1110,14 @@ def _run_site_actions(site, actions: list, creds: dict, session_log_dir: str = N
     threaded through to every progress_cb call this site's work makes
     from here on, so a GUI can key its display off a stable per-worker
     identity rather than per-site.
+
+    collect_tunnels_flag runs independently of which of 'cdp'/'arp' is
+    in `actions` - like collect_arp() itself, collect_tunnels() only
+    needs a CDP seed already flagged for this site from some earlier
+    run, not a CDP walk happening THIS run. It runs last, after
+    whatever else this call is doing, since ordering against the
+    others doesn't matter (it neither depends on nor is depended on by
+    the CDP/MAC/ARP data).
     """
     octet = site["site_octet"]
     slot = worker_slots.assign_site(octet) if worker_slots is not None else None
@@ -1003,11 +1132,14 @@ def _run_site_actions(site, actions: list, creds: dict, session_log_dir: str = N
     if "arp" in actions:
         print("--- ARP collection ---")
         collect_arp(site, creds, session_log_dir=session_log_dir, progress_cb=progress_cb, slot=slot)
+    if collect_tunnels_flag:
+        print("--- Tunnel collection ---")
+        collect_tunnels(site, creds, session_log_dir=session_log_dir, progress_cb=progress_cb, slot=slot)
 
 
 def run_for_sites(sites: list, actions: list, creds: dict, session_log_dir: str = None,
-                   collect_mac_tables: bool = False, max_workers: int = DISCOVERY_MAX_WORKERS,
-                   progress_cb=None) -> None:
+                   collect_mac_tables: bool = False, collect_tunnels_flag: bool = False,
+                   max_workers: int = DISCOVERY_MAX_WORKERS, progress_cb=None) -> None:
     """Run the given actions (any of 'cdp'/'arp') against each site,
     up to max_workers sites at a time. Shared by both the CLI and
     interactive-menu entry points so there's exactly one place that
@@ -1036,18 +1168,23 @@ def run_for_sites(sites: list, actions: list, creds: dict, session_log_dir: str 
     to be complete first - safe under concurrency because each site's
     links only ever come from that site's own walk.
 
+    collect_tunnels_flag (default False - opt-in): independent of
+    which of 'cdp'/'arp' is in `actions` - see collect_tunnels()'s own
+    docstring for why. Runs last for each site, via _run_site_actions().
+
     progress_cb: optional (event, site_octet, slot, phase, message)
     callback - see _report_progress()'s docstring for the full contract.
     Passed straight through to every site's discover_site()/
-    collect_arp()/correlate_mac_tables() calls for "status" updates,
-    PLUS this function emits its own "done"/"error" event once each
-    site's _run_site_actions() call finishes - one event per site,
-    marking that site as complete (successfully or not) regardless of
-    which action(s) it ran. Safe to call concurrently from every site's
-    worker thread at once.
+    collect_arp()/correlate_mac_tables()/collect_tunnels() calls for
+    "status" updates, PLUS this function emits its own "done"/"error"
+    event once each site's _run_site_actions() call finishes - one
+    event per site, marking that site as complete (successfully or
+    not) regardless of which action(s) it ran. Safe to call
+    concurrently from every site's worker thread at once.
     """
     action_label = "+".join(actions)
     mac_note = " (+MAC tables)" if collect_mac_tables and "cdp" in actions else ""
+    tunnel_note = " (+tunnels)" if collect_tunnels_flag else ""
     site_list = (
         ", ".join(s["site_octet"] for s in sites) if len(sites) <= 10 else f"{len(sites)} sites"
     )
@@ -1059,7 +1196,7 @@ def run_for_sites(sites: list, actions: list, creds: dict, session_log_dir: str 
     # connection when conn=None (its default) - nothing here needs to
     # be queued, since this is a single, one-shot write with no BFS
     # read-after-write dependency on it.
-    db.log_activity("discovery_run", f"{action_label}{mac_note} against site(s): {site_list}")
+    db.log_activity("discovery_run", f"{action_label}{mac_note}{tunnel_note} against site(s): {site_list}")
 
     if not sites:
         return
@@ -1075,6 +1212,7 @@ def run_for_sites(sites: list, actions: list, creds: dict, session_log_dir: str 
             pool.submit(
                 _run_site_actions, site, actions, creds,
                 session_log_dir=session_log_dir, collect_mac_tables=collect_mac_tables,
+                collect_tunnels_flag=collect_tunnels_flag,
                 progress_cb=progress_cb, worker_slots=worker_slots,
             ): site
             for site in sites
@@ -1372,6 +1510,11 @@ def run_cli(argv: list) -> None:
              "connection this run makes, to timestamped files under ./session_logs/. Off by default since it "
              "isn't needed for routine runs; turn on only when actively debugging a connection issue.",
     )
+    parser.add_argument(
+        "--collect-tunnels", action="store_true",
+        help="Also collect and match GRE tunnel interfaces (see collect_tunnels()). Independent of --action - "
+             "only needs a CDP seed already flagged for each site, not a CDP walk this run.",
+    )
     args = parser.parse_args(argv)
 
     actions = ["cdp", "arp"] if args.action == "all" else [args.action]
@@ -1396,7 +1539,7 @@ def run_cli(argv: list) -> None:
         print("No sites found in the database.")
         return
 
-    run_for_sites(sites, actions, creds, session_log_dir=session_log_dir)
+    run_for_sites(sites, actions, creds, session_log_dir=session_log_dir, collect_tunnels_flag=args.collect_tunnels)
 
 
 def run_menu() -> None:
