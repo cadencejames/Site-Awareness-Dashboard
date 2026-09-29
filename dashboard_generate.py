@@ -25,6 +25,8 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "uti
 import db  # noqa: E402
 import topology_layout  # noqa: E402
 import topology_svg  # noqa: E402
+import site_map_layout  # noqa: E402
+import site_map_svg  # noqa: E402
 import mac_parser  # noqa: E402
 
 OUTPUT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "dashboard")
@@ -55,6 +57,100 @@ toggleBtn.addEventListener("click", () => {
   localStorage.setItem("sad-theme", next);
   toggleBtn.textContent = next === "dark" ? "\\ud83c\\udf19" : "\\u2600\\ufe0f";
 });
+"""
+
+# Plain viewBox manipulation rather than a CSS transform on the <svg>
+# element itself - editing the viewBox keeps stroke widths/font sizes
+# defined in the SVG's own coordinate space looking correct at any
+# zoom level (a CSS transform would visually thicken/thin strokes as
+# it scales, unless every stroked element also carried
+# vector-effect="non-scaling-stroke", which is more to get right for
+# no real benefit here). Only used on site-map.html - conditionally
+# runs its setup only if a #map-viewport element is actually present,
+# so this same shared script block can also be included harmlessly
+# anywhere else THEME_TOGGLE_JS already is.
+SITE_MAP_PAN_ZOOM_JS = """
+(function(){
+  const viewport = document.getElementById("map-viewport");
+  if(!viewport) return;
+  const svg = document.getElementById("site-map");
+  const base = svg.viewBox.baseVal;
+  let view = { x: base.x, y: base.y, w: base.width, h: base.height };
+  const MIN_W = base.width * 0.15;
+  const MAX_W = base.width * 3;
+
+  function apply(){
+    svg.setAttribute("viewBox", view.x + " " + view.y + " " + view.w + " " + view.h);
+  }
+
+  function clientToSvg(clientX, clientY){
+    const rect = svg.getBoundingClientRect();
+    return {
+      x: view.x + ((clientX - rect.left) / rect.width) * view.w,
+      y: view.y + ((clientY - rect.top) / rect.height) * view.h,
+    };
+  }
+
+  function zoomAt(clientX, clientY, factor){
+    const newW = Math.min(MAX_W, Math.max(MIN_W, view.w * factor));
+    const newH = newW * (view.h / view.w);
+    const anchor = clientToSvg(clientX, clientY);
+    view.x = anchor.x - ((anchor.x - view.x) * (newW / view.w));
+    view.y = anchor.y - ((anchor.y - view.y) * (newH / view.h));
+    view.w = newW;
+    view.h = newH;
+    apply();
+  }
+
+  function zoomAtCenter(factor){
+    const rect = svg.getBoundingClientRect();
+    zoomAt(rect.left + rect.width / 2, rect.top + rect.height / 2, factor);
+  }
+
+  viewport.addEventListener("wheel", (e) => {
+    e.preventDefault();
+    zoomAt(e.clientX, e.clientY, e.deltaY > 0 ? 1.15 : 1 / 1.15);
+  }, { passive: false });
+
+  // dragMoved distinguishes an actual pan from a plain click on a site
+  // node (which should still navigate to that site's page) - a click
+  // is only ever cancelled if the mouse genuinely moved past a small
+  // threshold between mousedown and mouseup, not just because a drag
+  // sequence technically started and ended on the same node.
+  let dragging = false, dragMoved = false, lastX = 0, lastY = 0;
+  viewport.addEventListener("mousedown", (e) => {
+    dragging = true; dragMoved = false; lastX = e.clientX; lastY = e.clientY;
+    viewport.classList.add("dragging");
+  });
+  window.addEventListener("mousemove", (e) => {
+    if(!dragging) return;
+    if(Math.abs(e.clientX - lastX) > 2 || Math.abs(e.clientY - lastY) > 2) dragMoved = true;
+    const rect = svg.getBoundingClientRect();
+    view.x -= (e.clientX - lastX) * (view.w / rect.width);
+    view.y -= (e.clientY - lastY) * (view.h / rect.height);
+    lastX = e.clientX; lastY = e.clientY;
+    apply();
+  });
+  window.addEventListener("mouseup", () => {
+    dragging = false;
+    viewport.classList.remove("dragging");
+  });
+  svg.addEventListener("click", (e) => {
+    if(dragMoved){ e.preventDefault(); e.stopPropagation(); }
+  }, true);
+
+  const zoomInBtn = document.getElementById("map-zoom-in");
+  const zoomOutBtn = document.getElementById("map-zoom-out");
+  const resetBtn = document.getElementById("map-zoom-reset");
+  if(zoomInBtn) zoomInBtn.addEventListener("click", () => zoomAtCenter(1 / 1.4));
+  if(zoomOutBtn) zoomOutBtn.addEventListener("click", () => zoomAtCenter(1.4));
+  if(resetBtn) resetBtn.addEventListener("click", () => {
+    view = { x: base.x, y: base.y, w: base.width, h: base.height };
+    apply();
+  });
+
+  apply();
+})();
 """
 
 
@@ -433,6 +529,96 @@ def _render_vrf_groups_html(rows) -> str:
     return "".join(html_parts)
 
 
+def render_tunnels_html(interface_rows, link_rows, site_last_tunnel_collection) -> str:
+    """interface_rows: db.get_tunnel_interfaces_for_site() - the raw,
+    per-interface data (status, description, internet_address, source/
+    destination IPs). link_rows: db.get_tunnel_links_for_site() - the
+    resolved match state for each of this site's own tunnel interfaces
+    (see tunnel_links' schema comment for why this site's panel only
+    ever shows its OWN half of a pair - the far site's own page shows
+    its own row independently).
+
+    Joined here by (device_id, interface) rather than queried as one
+    combined SQL statement, since the two tables serve different
+    purposes (raw collected data vs. a derived global correlation) and
+    keeping them as separate db.py accessors means match_tunnels()
+    re-runs don't require re-deriving anything this function already
+    has cached - it just re-reads both.
+
+    Three distinct badge states, deliberately NOT all using the same
+    "stale" styling (that word is reserved for "this data is old" -
+    see _is_stale() elsewhere on this page):
+      - matched: a real reverse row was found at collection time -
+        green/up-styled, names the far end.
+      - one-sided: no reverse row was found (far site not yet
+        collected, or the tunnel really was removed on that end) -
+        warn-styled, surfaced rather than hidden (see match_tunnels()'s
+        own docstring for why this is deliberate, not a bug).
+      - unparsed: this interface's 'Tunnel source ..., destination ...'
+        line didn't parse at all, so match_tunnels() had nothing to
+        even attempt a match with - dim/neutral styled, distinct from
+        "one-sided" since there's no meaningful source/destination to
+        report here at all, not just a missing far end.
+    Interface up/down status gets its own separate badge, independent
+    of match state - a matched tunnel can still be administratively
+    down, and that's worth seeing at a glance too.
+    """
+    if not interface_rows:
+        return (
+            '<p style="padding:14px; font-family:var(--mono); font-size:12px; color:var(--text-dim);">'
+            'No tunnel data collected yet - run discovery with "Also collect tunnel interfaces" enabled.</p>'
+        )
+
+    link_by_key = {(lr["device_a_id"], lr["device_a_interface"]): lr for lr in link_rows}
+
+    def sort_key(row):
+        return (row["device_hostname"] or "", _interface_sort_key(row["interface"]))
+
+    rows_html = []
+    for row in sorted(interface_rows, key=sort_key):
+        link_row = link_by_key.get((row["device_id"], row["interface"]))
+
+        badges = []
+        if not (row["admin_status"] == "up" and row["line_protocol"] == "up"):
+            status_label = f'{row["admin_status"] or "?"} / {row["line_protocol"] or "?"}'
+            badges.append(f'<span class="badge tunnel-down">{_esc(status_label)}</span>')
+
+        if link_row is None:
+            badges.append('<span class="badge tunnel-unparsed">unparsed</span>')
+        elif link_row["device_b_id"] is not None:
+            far_label = link_row["device_b_hostname"]
+            far_site = link_row["device_b_site_name"] or link_row["device_b_site_octet"] or "?"
+            badges.append(f'<span class="badge tunnel-matched">matched → {_esc(far_label)} ({_esc(far_site)})</span>')
+        else:
+            badges.append('<span class="badge tunnel-one-sided">one-sided</span>')
+
+        if _is_stale(row["last_seen"], site_last_tunnel_collection):
+            badges.append('<span class="badge stale">stale</span>')
+
+        meta_bits = []
+        if row["description"]:
+            meta_bits.append(row["description"])
+        if row["internet_address"]:
+            meta_bits.append(row["internet_address"])
+        if row["source_ip"] and row["destination_ip"]:
+            meta_bits.append(f'{row["source_ip"]} → {row["destination_ip"]}')
+        elif row["source_ip"]:
+            meta_bits.append(f'src {row["source_ip"]} (no destination parsed)')
+        meta = " · ".join(_esc(b) for b in meta_bits) if meta_bits else "-"
+
+        rows_html.append(f'''
+    <div class="row">
+      <div class="main">
+        <div class="name">{_esc(row["device_hostname"])} · {_esc(row["interface"])}</div>
+        <div class="meta">{meta}</div>
+      </div>
+      <div class="badges">
+        {"".join(badges)}
+      </div>
+    </div>''')
+    return "".join(rows_html)
+
+
 def render_arp_tables_html(arp_rows, site_last_arp_collection) -> str:
     """Active and stale entries are split FIRST, then grouped by VRF
     independently within each - not nested the other way around - so
@@ -499,6 +685,8 @@ def render_site_page(conn, site_row) -> str:
     devices_rows = sorted(db.get_devices_for_site(conn, site_id), key=lambda d: _ip_sort_key(d["mgmt_ip"]))
     arp_rows = db.get_arp_for_site(conn, site_id)
     client_rows = db.get_clients_for_site(conn, site_id)
+    tunnel_interface_rows = db.get_tunnel_interfaces_for_site(conn, site_id)
+    tunnel_link_rows = db.get_tunnel_links_for_site(conn, site_id)
     seed = db.get_seed_device_for_site(conn, site_id)
     arp_seed = db.get_arp_seed_device_for_site(conn, site_id)
 
@@ -599,6 +787,10 @@ details:not([open]) > .panel-head .chevron, details:not([open]) > .vrf-group-hea
 .badge.source-manual{{ color:var(--accent); border-color:var(--accent-dim); }}
 .badge.role{{ color:var(--accent); border-color:var(--accent-dim); }}
 .badge.stale{{ color:var(--text-dim); border-style:dashed; }}
+.badge.tunnel-matched{{ color:var(--up); border-color:color-mix(in srgb, var(--up) 40%, var(--border)); }}
+.badge.tunnel-one-sided{{ color:var(--warn); border-color:color-mix(in srgb, var(--warn) 40%, var(--border)); }}
+.badge.tunnel-down{{ color:var(--warn); border-color:color-mix(in srgb, var(--warn) 40%, var(--border)); }}
+.badge.tunnel-unparsed{{ color:var(--text-dim); border-style:dashed; }}
 .vrf-groups{{ padding:14px; }}
 .vrf-group{{ border:1px solid var(--border); border-radius:8px; overflow:hidden; margin-bottom:14px; display:block; }}
 .vrf-group-head{{ background:var(--panel-2); padding:9px 14px; font-family:var(--mono); font-size:13px; font-weight:700; text-transform:uppercase; letter-spacing:.06em; color:var(--text); display:flex; justify-content:space-between; cursor:pointer; list-style:none; }}
@@ -628,7 +820,7 @@ footer{{ margin-top:20px; font-family:var(--mono); font-size:11px; color:var(--t
   <header>
     <div>
       <h1>{_esc(site_label)}{code_label}</h1>
-      <div class="subtitle">octet {_esc(site_row['site_octet'])} · CDP seed: {_esc(seed_label)} · ARP seed: {_esc(arp_seed_label)}{arp_override_note} · last CDP {_fmt_ts(site_row['last_cdp_discovery'])} · last ARP {_fmt_ts(site_row['last_arp_collection'])}</div>
+      <div class="subtitle">octet {_esc(site_row['site_octet'])} · CDP seed: {_esc(seed_label)} · ARP seed: {_esc(arp_seed_label)}{arp_override_note} · last CDP {_fmt_ts(site_row['last_cdp_discovery'])} · last ARP {_fmt_ts(site_row['last_arp_collection'])} · last tunnels {_fmt_ts(site_row['last_tunnel_collection'])}</div>
     </div>
     <div class="header-actions">
       <button class="icon-btn" id="theme-toggle" title="Toggle theme">\U0001F319</button>
@@ -649,6 +841,11 @@ footer{{ margin-top:20px; font-family:var(--mono); font-size:11px; color:var(--t
   <details class="panel" open>
     <summary class="panel-head"><span class="label"><span class="chevron">\u25b8</span>ARP Tables</span><span class="count">{vrf_count} tables · {total_arp} entries</span></summary>
     {render_arp_tables_html(arp_rows, site_row["last_arp_collection"])}
+  </details>
+
+  <details class="panel" open>
+    <summary class="panel-head"><span class="label"><span class="chevron">\u25b8</span>Tunnels</span><span class="count">{len(tunnel_interface_rows)} total</span></summary>
+    <div>{render_tunnels_html(tunnel_interface_rows, tunnel_link_rows, site_row["last_tunnel_collection"])}</div>
   </details>
 
   <details class="panel">
@@ -800,6 +997,7 @@ footer{{ margin-top:20px; font-family:var(--mono); font-size:11px; color:var(--t
       <div class="subtitle">{len(real_sites)} sites · {total_devices} devices tracked · generated {generated_at}</div>
     </div>
     <div class="header-actions">
+      <a class="btn" href="site-map.html">Site Map</a>
       <a class="btn" href="clients.html">Search Clients</a>
       <a class="btn" href="exports.html">Exports</a>
       <a class="btn" href="site-unassigned.html">Unassigned ({unassigned_count})</a>
@@ -839,6 +1037,276 @@ document.getElementById("search").addEventListener("input", (e) => {{
   }});
   document.getElementById("visible-count").textContent = `${{visible}} shown`;
 }});
+{THEME_TOGGLE_JS}
+</script>
+</body>
+</html>
+'''
+
+
+# ---------------------------------------------------------------------
+# All-site map
+# ---------------------------------------------------------------------
+
+def build_site_map_data(conn) -> dict:
+    """Assembles everything site_map_layout.compute_layout()/
+    arrange_isolated() and site_map_svg.render_svg() need: which real
+    sites have qualifying inter-site connections, the deduplicated edge
+    list, and per-site display metadata.
+
+    Two distinct edge sources, each deduplicated by the actual DEVICE
+    pair (not just the site pair) before being aggregated into a site
+    pair count - a physical connection recorded from BOTH ends' own
+    scans (once each site has scanned the other) is the same real
+    connection, not two:
+      - CDP: any links row where the two devices belong to different
+        real sites (Unassigned is excluded - it isn't a real site to
+        map, same as everywhere else in the dashboard).
+      - Tunnel: matched tunnel_links rows (device_b_id set) whose two
+        devices belong to different real sites. A ONE-SIDED tunnel
+        (device_b_id NULL - see match_tunnels()'s own docstring) has
+        no known far end to draw an edge to, so it's counted per
+        origin site instead and surfaced as a marker on that site's
+        own node, not as a dangling edge.
+    """
+    real_sites = db.get_all_sites(conn, include_unassigned=False)
+    real_site_ids = {s["id"] for s in real_sites}
+
+    device_counts = {}
+    for s in real_sites:
+        device_counts[s["id"]] = conn.execute(
+            "SELECT COUNT(*) AS c FROM devices WHERE site_id = ?", (s["id"],)
+        ).fetchone()["c"]
+
+    cdp_rows = conn.execute(
+        """
+        SELECT l.device_a_id, l.device_b_id, da.site_id AS site_a_id, db_.site_id AS site_b_id
+        FROM links l
+        JOIN devices da ON l.device_a_id = da.id
+        JOIN devices db_ ON l.device_b_id = db_.id
+        WHERE da.site_id != db_.site_id AND da.deleted_at IS NULL AND db_.deleted_at IS NULL
+        """
+    ).fetchall()
+    cdp_device_pairs = {}
+    for row in cdp_rows:
+        if row["site_a_id"] not in real_site_ids or row["site_b_id"] not in real_site_ids:
+            continue  # e.g. the other end is filed under Unassigned - not a real site to map
+        key = frozenset((row["device_a_id"], row["device_b_id"]))
+        cdp_device_pairs[key] = (row["site_a_id"], row["site_b_id"])
+
+    cdp_site_pair_counts = {}
+    for site_a_id, site_b_id in cdp_device_pairs.values():
+        key = frozenset((site_a_id, site_b_id))
+        cdp_site_pair_counts[key] = cdp_site_pair_counts.get(key, 0) + 1
+
+    tunnel_rows = db.get_all_tunnel_links(conn)
+    tunnel_device_pairs = {}
+    # Interface name(s) for each device pair - a matched tunnel_links
+    # pair produces two mirror-image rows (one from each side's own
+    # perspective), and each row already carries BOTH ends' interface
+    # names, so either row alone is enough; both are folded in here
+    # (via a set) purely so this stays correct even if that ever
+    # changes. Tracked per device pair first, then rolled up into
+    # per-site-pair edges below, same shape as the counts.
+    tunnel_device_pair_names = {}
+    one_sided_counts = {}
+    for row in tunnel_rows:
+        if row["device_a_site_id"] not in real_site_ids:
+            continue
+        if row["device_b_id"] is None:
+            one_sided_counts[row["device_a_site_id"]] = one_sided_counts.get(row["device_a_site_id"], 0) + 1
+            continue
+        if row["device_b_site_id"] not in real_site_ids:
+            continue
+        if row["device_a_site_id"] == row["device_b_site_id"]:
+            continue  # a tunnel between two devices at the same site - not an inter-site connection to map
+        key = frozenset((row["device_a_id"], row["device_b_id"]))
+        tunnel_device_pairs[key] = (row["device_a_site_id"], row["device_b_site_id"])
+        names = tunnel_device_pair_names.setdefault(key, set())
+        if row["device_a_interface"]:
+            names.add(row["device_a_interface"])
+        if row["device_b_interface"]:
+            names.add(row["device_b_interface"])
+
+    tunnel_site_pair_counts = {}
+    tunnel_site_pair_names = {}
+    for dev_key, (site_a_id, site_b_id) in tunnel_device_pairs.items():
+        key = frozenset((site_a_id, site_b_id))
+        tunnel_site_pair_counts[key] = tunnel_site_pair_counts.get(key, 0) + 1
+        tunnel_site_pair_names.setdefault(key, set()).update(tunnel_device_pair_names.get(dev_key, ()))
+
+    edges = []
+    for pair_key, count in cdp_site_pair_counts.items():
+        site_a_id, site_b_id = tuple(pair_key)
+        edges.append({"site_a_id": site_a_id, "site_b_id": site_b_id, "kind": "cdp", "count": count})
+    for pair_key, count in tunnel_site_pair_counts.items():
+        site_a_id, site_b_id = tuple(pair_key)
+        edges.append({
+            "site_a_id": site_a_id,
+            "site_b_id": site_b_id,
+            "kind": "tunnel",
+            "count": count,
+            "tunnel_names": sorted(tunnel_site_pair_names.get(pair_key, set())),
+        })
+
+    connected_site_ids = set()
+    for edge in edges:
+        connected_site_ids.add(edge["site_a_id"])
+        connected_site_ids.add(edge["site_b_id"])
+    isolated_site_ids = real_site_ids - connected_site_ids
+
+    site_meta = {}
+    for s in real_sites:
+        if not s["last_cdp_discovery"]:
+            status = "none"
+        elif _is_recent(s["last_cdp_discovery"]):
+            status = "up"
+        else:
+            status = "stale"
+        site_meta[s["id"]] = {
+            "label": s["site_name"] or f"octet {s['site_octet']}",
+            "octet": s["site_octet"],
+            "href": f"site-{s['site_octet']}.html",
+            "device_count": device_counts[s["id"]],
+            "status": status,
+            "one_sided_tunnels": one_sided_counts.get(s["id"], 0),
+        }
+
+    return {
+        "connected_site_ids": list(connected_site_ids),
+        "isolated_site_ids": list(isolated_site_ids),
+        "edges": edges,
+        "site_meta": site_meta,
+    }
+
+
+def render_site_map_page(conn) -> str:
+    data = build_site_map_data(conn)
+    layout = site_map_layout.compute_layout(data["connected_site_ids"], data["edges"])
+
+    cluster_bottom = site_map_layout.MARGIN
+    if layout["positions"]:
+        cluster_bottom = max(y for _x, y in layout["positions"].values()) + site_map_layout.MARGIN
+
+    isolated = site_map_layout.arrange_isolated(data["isolated_site_ids"], cluster_bottom)
+
+    canvas_width = site_map_layout.CANVAS_WIDTH
+    canvas_height = max(
+        site_map_layout.CANVAS_HEIGHT,
+        int(cluster_bottom + isolated["height"] + site_map_layout.MARGIN),
+    )
+
+    svg = site_map_svg.render_svg(
+        layout["positions"], isolated["positions"], data["edges"], data["site_meta"],
+        canvas_width, canvas_height,
+    )
+
+    connected_count = len(data["connected_site_ids"])
+    isolated_count = len(data["isolated_site_ids"])
+    cdp_edge_count = sum(1 for e in data["edges"] if e["kind"] == "cdp")
+    tunnel_edge_count = sum(1 for e in data["edges"] if e["kind"] == "tunnel")
+    generated_at = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+
+    isolated_note = ""
+    if isolated_count:
+        isolated_note = (
+            f'<p style="padding:0 14px 14px; font-family:var(--mono); font-size:11.5px; color:var(--text-dim);">'
+            f'{isolated_count} site(s) below have no known CDP or tunnel connection to any other site - '
+            f'shown in a fixed grid, not part of the force-directed layout above (see legend).</p>'
+        )
+
+    return f'''<!DOCTYPE html>
+<html lang="en" data-theme="light">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>All-Site Map — Site Awareness Dashboard</title>
+<style>
+{CSS_TOKENS}
+*{{ box-sizing: border-box; }}
+body{{ margin:0; background:var(--bg); color:var(--text); font-family:var(--sans); -webkit-font-smoothing:antialiased; }}
+.wrap{{ max-width:1400px; margin:0 auto; padding:24px 24px 60px; }}
+.backlink{{ display:inline-block; font-family:var(--mono); font-size:12px; color:var(--text-dim); border:1px solid var(--border); border-radius:999px; padding:5px 12px; text-decoration:none; margin-bottom:14px; }}
+.backlink:hover{{ color:var(--accent); border-color:var(--accent); }}
+header{{ display:flex; justify-content:space-between; align-items:flex-end; border-bottom:2px solid var(--border); padding-bottom:16px; margin-bottom:20px; gap:16px; flex-wrap:wrap; }}
+header h1{{ margin:0; font-size:22px; font-weight:700; }}
+.subtitle{{ font-family:var(--mono); font-size:12px; color:var(--text-dim); margin-top:4px; }}
+button, .btn{{ background:var(--panel-2); border:1px solid var(--border); border-radius:8px; color:var(--text); font-family:var(--sans); font-size:13px; padding:8px 14px; cursor:pointer; transition:border-color .15s ease, transform .1s ease; text-decoration:none; display:inline-block; }}
+button:hover, .btn:hover{{ border-color:var(--accent); }}
+button:active, .btn:active{{ transform:scale(.97); }}
+.icon-btn{{ width:38px; height:38px; padding:0; display:flex; align-items:center; justify-content:center; font-size:16px; }}
+.panel{{ background:var(--panel); border:1px solid var(--border); border-radius:var(--radius); overflow:hidden; margin-bottom:18px; }}
+.panel-head{{ background:var(--panel-2); border-bottom:1px solid var(--border); padding:8px 14px; display:flex; justify-content:space-between; align-items:center; }}
+.panel-head .label{{ font-size:12px; font-weight:700; text-transform:uppercase; letter-spacing:.06em; }}
+.panel-head .count{{ font-family:var(--mono); font-size:11px; background:var(--bg); border:1px solid var(--border); border-radius:999px; padding:2px 9px; color:var(--text-dim); }}
+#map-viewport{{ position:relative; width:100%; height:70vh; min-height:460px; overflow:hidden; background:var(--bg); cursor:grab; }}
+#map-viewport.dragging{{ cursor:grabbing; }}
+#site-map{{ width:100%; height:100%; display:block; touch-action:none; }}
+.map-controls{{ position:absolute; top:12px; right:12px; display:flex; flex-direction:column; gap:6px; z-index:2; }}
+.map-controls button{{ width:32px; height:32px; padding:0; font-size:16px; line-height:1; }}
+.map-hint{{ position:absolute; bottom:10px; left:12px; font-family:var(--mono); font-size:10.5px; color:var(--text-dim); background:color-mix(in srgb, var(--panel) 80%, transparent); border:1px solid var(--border); border-radius:6px; padding:4px 9px; pointer-events:none; }}
+.site-node-link{{ text-decoration:none; cursor:pointer; }}
+.site-node-circle{{ fill:var(--panel-2); stroke:var(--border); stroke-width:1.5; transition:stroke .1s ease, stroke-width .1s ease; }}
+.site-node:hover .site-node-circle{{ stroke:var(--accent); stroke-width:2.5; }}
+.site-node-circle.site-node-up{{ stroke:var(--up); }}
+.site-node-circle.site-node-stale{{ stroke:var(--warn); }}
+.site-node-circle.site-node-none{{ stroke:var(--border); stroke-dasharray:2 2; }}
+.site-node-warn-dot{{ fill:var(--warn); stroke:var(--bg); stroke-width:1.5; }}
+.site-node-label{{ font-family:var(--mono); font-size:10.5px; fill:var(--text); }}
+.site-node-sub{{ font-family:var(--mono); font-size:9px; fill:var(--text-dim); }}
+.site-edge{{ stroke:var(--text-dim); stroke-width:1.3; opacity:0.55; }}
+.site-edge.tunnel{{ stroke:var(--accent); stroke-dasharray:5 4; opacity:0.85; }}
+.site-edge-group:hover .site-edge{{ stroke:var(--accent); opacity:1; stroke-width:2.4; }}
+.legend{{ display:flex; gap:22px; flex-wrap:wrap; padding:10px 14px; font-family:var(--mono); font-size:11px; color:var(--text-dim); border-top:1px solid var(--border); }}
+.legend-item{{ display:flex; align-items:center; gap:6px; }}
+.legend-swatch{{ width:22px; height:0; border-top:2px solid var(--text-dim); display:inline-block; }}
+.legend-swatch.tunnel{{ border-top:2px dashed var(--accent); }}
+.legend-dot{{ width:9px; height:9px; border-radius:50%; display:inline-block; border:1.5px solid var(--border); background:var(--panel-2); }}
+.legend-dot.up{{ border-color:var(--up); }}
+.legend-dot.stale{{ border-color:var(--warn); }}
+.legend-dot.none{{ border-color:var(--border); border-style:dashed; }}
+footer{{ margin-top:20px; font-family:var(--mono); font-size:11px; color:var(--text-dim); text-align:center; }}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <a class="backlink" href="index.html">\u2190 All Sites</a>
+  <header>
+    <div>
+      <h1>All-Site Map</h1>
+      <div class="subtitle">{connected_count} connected \u00b7 {isolated_count} isolated \u00b7 {cdp_edge_count} CDP link(s) \u00b7 {tunnel_edge_count} tunnel link(s) \u00b7 generated {generated_at}</div>
+    </div>
+    <div class="header-actions">
+      <button class="icon-btn" id="theme-toggle" title="Toggle theme">\U0001F319</button>
+    </div>
+  </header>
+
+  <div class="panel">
+    <div class="panel-head"><span class="label">Site Map</span><span class="count">{connected_count + isolated_count} sites</span></div>
+    <div id="map-viewport">
+      {svg}
+      <div class="map-controls">
+        <button id="map-zoom-in" title="Zoom in">+</button>
+        <button id="map-zoom-out" title="Zoom out">−</button>
+        <button id="map-zoom-reset" title="Reset view">⌂</button>
+      </div>
+      <div class="map-hint">Scroll to zoom · drag to pan</div>
+    </div>
+    <div class="legend">
+      <div class="legend-item"><span class="legend-swatch"></span>CDP-discovered link</div>
+      <div class="legend-item"><span class="legend-swatch tunnel"></span>Matched tunnel</div>
+      <div class="legend-item"><span class="legend-dot up"></span>Recently scanned</div>
+      <div class="legend-item"><span class="legend-dot stale"></span>Not recently scanned</div>
+      <div class="legend-item"><span class="legend-dot none"></span>Never CDP-scanned</div>
+      <div class="legend-item"><span class="site-node-warn-dot" style="width:9px;height:9px;border-radius:50%;display:inline-block;"></span>Has an unconfirmed (one-sided) tunnel</div>
+    </div>
+    {isolated_note}
+  </div>
+
+  <footer>Site Awareness Dashboard — All-Site Map, generated from sad.db, read-only</footer>
+</div>
+<script>
+{SITE_MAP_PAN_ZOOM_JS}
 {THEME_TOGGLE_JS}
 </script>
 </body>
@@ -1229,6 +1697,14 @@ def generate_index(conn) -> str:
     return path
 
 
+def generate_site_map(conn) -> str:
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    path = os.path.join(OUTPUT_DIR, "site-map.html")
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(render_site_map_page(conn))
+    return path
+
+
 def generate_all(db_path: str = None):
     db_path = db_path or db.DB_PATH
     with db.get_conn(db_path) as conn:
@@ -1240,6 +1716,12 @@ def generate_all(db_path: str = None):
         print(f"  Wrote {index_path}")
         clients_path = generate_client_search_page(conn)
         print(f"  Wrote {clients_path}")
+        # Re-derived from every site's own links/tunnel_links each
+        # time, same as the index page and client search - not
+        # incrementally updatable, so it's always fully regenerated
+        # alongside them rather than only on some separate trigger.
+        site_map_path = generate_site_map(conn)
+        print(f"  Wrote {site_map_path}")
     print(f"Generated {len(sites)} site page(s) + index.")
 
 
@@ -1256,6 +1738,12 @@ def generate_one(site_key: str, db_path: str = None):
         print(f"  Wrote {index_path}")
         clients_path = generate_client_search_page(conn)
         print(f"  Wrote {clients_path}")
+        # This one site's own cross-site links/tunnels can change the
+        # all-site map too (a new inter-site edge, a newly-matched
+        # tunnel) - regenerated alongside the index for the same
+        # reason, every time, not just on a full "all sites" run.
+        site_map_path = generate_site_map(conn)
+        print(f"  Wrote {site_map_path}")
 
 
 if __name__ == "__main__":

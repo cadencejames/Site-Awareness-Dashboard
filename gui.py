@@ -1430,6 +1430,14 @@ class DiscoveryTab(ttk.Frame):
                         # stale the moment this site's data changes.
                         index_path = dashboard_generate.generate_index(conn)
                         print(f"  Wrote {index_path}")
+                        # Same reasoning - this site's own cross-site
+                        # links/tunnels can change the all-site map too
+                        # (a new inter-site edge, a newly-matched
+                        # tunnel), so it's kept in lockstep with the
+                        # index rather than only refreshed on a full
+                        # "all sites" run.
+                        site_map_path = dashboard_generate.generate_site_map(conn)
+                        print(f"  Wrote {site_map_path}")
         except Exception as e:
             print(f"ERROR: {e}")
         finally:
