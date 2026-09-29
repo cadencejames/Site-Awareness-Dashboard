@@ -34,6 +34,7 @@ Design (agreed on before writing this):
     other, not just from directly-linked neighbors.
 """
 
+import math
 import random
 
 # Standard Fruchterman-Reingold tuning - k is the "ideal" distance
@@ -52,6 +53,30 @@ RANDOM_SEED = 20260101
 ISOLATED_COLUMNS = 8       # how many isolated-site boxes per row
 ISOLATED_ROW_HEIGHT = 70
 ISOLATED_COL_WIDTH = 170
+
+# Two nodes settling on top of (or very near) each other is always
+# possible in a force-directed layout - a pair with a heavy edge
+# weight and few other nodes pulling on it, a small `k` on a large
+# fleet, or just an unlucky equilibrium - the physics doesn't promise
+# a minimum spacing on its own, only that forces balance out
+# *somewhere*. Rather than chase every possible cause, a fixed
+# separation floor is enforced as a final pass below: guaranteed
+# readable node spacing regardless of what produced the layout.
+# Comfortably bigger than twice the largest node radius
+# (site_map_svg.MAX_RADIUS = 28) plus room for the label text under
+# each node - not derived from that constant directly, to keep this
+# module's only concern being positions, not how a site is drawn.
+MIN_NODE_SEPARATION = 85
+SEPARATION_PASSES = 40
+
+# How much extra repulsion a node's total edge weight buys it against
+# every other node - see compute_layout()'s own comment on `weight`
+# for why this exists. 0 would be plain unweighted Fruchterman-
+# Reingold; tuned empirically so two heavily-connected hubs visibly
+# separate without ordinary leaf-leaf pairs being pushed apart much at
+# all (their weights are small, so this term stays close to 1.0 for
+# them).
+HUB_REPULSION_STRENGTH = 0.35
 
 
 def _connected_components(node_ids, edges):
@@ -109,6 +134,28 @@ def compute_layout(site_ids: list, edges: list) -> dict:
     area = (CANVAS_WIDTH - 2 * MARGIN) * (CANVAS_HEIGHT - 2 * MARGIN)
     k = (area / len(site_ids)) ** 0.5
 
+    # A node's "weight" is the total edge count touching it (e.g. a
+    # hub with matched tunnels to five other sites has a higher weight
+    # than a site with just one). Plain Fruchterman-Reingold gives
+    # every pair of nodes the same repulsion regardless of how
+    # connected either one is - so two hub sites, each pulled toward
+    # the middle of the layout by many attraction forces, end up right
+    # next to each other with nothing pushing back harder than it
+    # would for two ordinary leaf sites. HUB_REPULSION_STRENGTH scales
+    # repulsion up for pairs where at least one side is well-connected,
+    # so hubs actively carve out extra space from each other (and from
+    # everything else) instead of just landing on top of each other by
+    # coincidence. A random-seed change can accidentally dodge that for
+    # one particular dataset, but isn't a real fix - this is.
+    weight = {site_id: 0.0 for site_id in site_ids}
+    for edge in edges:
+        a, b = edge["site_a_id"], edge["site_b_id"]
+        w = edge.get("count", 1)
+        if a in weight:
+            weight[a] += w
+        if b in weight:
+            weight[b] += w
+
     # --- initial placement: one blob per connected component, laid
     # out on a coarse grid of component-centers so separate clusters
     # start apart rather than on top of each other. ---
@@ -136,13 +183,17 @@ def compute_layout(site_ids: list, edges: list) -> dict:
     for _iteration in range(ITERATIONS):
         disp = {site_id: [0.0, 0.0] for site_id in site_ids}
 
-        # Repulsion: every pair, regardless of component.
+        # Repulsion: every pair, regardless of component. Scaled up for
+        # well-connected nodes (see `weight`/HUB_REPULSION_STRENGTH
+        # above) so two hubs carve out extra distance from each other,
+        # not just from the graph as a whole.
         for i, a in enumerate(site_ids):
             for b in site_ids[i + 1:]:
                 dx = pos[a][0] - pos[b][0]
                 dy = pos[a][1] - pos[b][1]
                 dist = max(0.01, (dx * dx + dy * dy) ** 0.5)
-                force = (k * k) / dist
+                hub_factor = 1.0 + HUB_REPULSION_STRENGTH * (weight[a] + weight[b])
+                force = (k * k * hub_factor) / dist
                 fx, fy = (dx / dist) * force, (dy / dist) * force
                 disp[a][0] += fx
                 disp[a][1] += fy
@@ -150,9 +201,8 @@ def compute_layout(site_ids: list, edges: list) -> dict:
                 disp[b][1] -= fy
 
         # Attraction: along each edge, scaled by how many real
-        # connections it represents (a site pair with 3 CDP links or a
-        # matched tunnel plus a CDP link pulls a bit tighter than a
-        # single lone connection).
+        # connections it represents (a site pair with 3 matched
+        # tunnels pulls a bit tighter than a single lone one).
         for edge in edges:
             a, b = edge["site_a_id"], edge["site_b_id"]
             if a not in pos or b not in pos:
@@ -160,8 +210,8 @@ def compute_layout(site_ids: list, edges: list) -> dict:
             dx = pos[a][0] - pos[b][0]
             dy = pos[a][1] - pos[b][1]
             dist = max(0.01, (dx * dx + dy * dy) ** 0.5)
-            weight = 1.0 + 0.15 * (edge.get("count", 1) - 1)
-            force = ((dist * dist) / k) * weight
+            edge_weight = 1.0 + 0.15 * (edge.get("count", 1) - 1)
+            force = ((dist * dist) / k) * edge_weight
             fx, fy = (dx / dist) * force, (dy / dist) * force
             disp[a][0] -= fx
             disp[a][1] -= fy
@@ -181,7 +231,62 @@ def compute_layout(site_ids: list, edges: list) -> dict:
 
         temperature = max(1.0, temperature - cooling)
 
+    _enforce_min_separation(pos, site_ids, rng)
+
     return {"positions": {site_id: (x, y) for site_id, (x, y) in pos.items()}}
+
+
+def _enforce_min_separation(pos: dict, site_ids: list, rng: random.Random) -> None:
+    """Final pass after the force simulation has settled: pushes apart
+    any pair of nodes still closer than MIN_NODE_SEPARATION, so the
+    rendered map never shows two site nodes overlapping or crowded
+    into unreadable proximity, no matter what caused it (see
+    MIN_NODE_SEPARATION's own comment). Mutates `pos` in place.
+
+    Deliberately a separate, simple pass rather than folded into the
+    main loop's repulsion force - the main loop is tuned to produce a
+    good overall *shape* (clusters near their neighbors, separate
+    components apart), and cranking repulsion up further to guarantee
+    a hard minimum there would fight that tuning. This only steps in
+    for the specific pairs that need it, once the general shape is
+    already decided.
+
+    Runs a fixed number of passes (rather than looping until clean)
+    since resolving one pair can nudge another pair back under the
+    threshold - a few passes converge in practice for the number of
+    site nodes this map ever has, and a fixed budget keeps this
+    provably bounded rather than a potential infinite loop on some
+    pathological input.
+    """
+    for _pass in range(SEPARATION_PASSES):
+        moved = False
+        for i, a in enumerate(site_ids):
+            for b in site_ids[i + 1:]:
+                dx = pos[a][0] - pos[b][0]
+                dy = pos[a][1] - pos[b][1]
+                dist = (dx * dx + dy * dy) ** 0.5
+                if dist >= MIN_NODE_SEPARATION:
+                    continue
+                moved = True
+                if dist < 0.01:
+                    # Exactly (or almost exactly) coincident - no real
+                    # direction to push along, so pick one at random
+                    # rather than leaving them stacked.
+                    angle = rng.random() * 6.283185307179586
+                    dx, dy = math.cos(angle), math.sin(angle)
+                    dist = 1.0
+                push = (MIN_NODE_SEPARATION - dist) / 2.0
+                ux, uy = dx / dist, dy / dist
+                pos[a][0] += ux * push
+                pos[a][1] += uy * push
+                pos[b][0] -= ux * push
+                pos[b][1] -= uy * push
+                pos[a][0] = min(CANVAS_WIDTH - MARGIN, max(MARGIN, pos[a][0]))
+                pos[a][1] = min(CANVAS_HEIGHT - MARGIN, max(MARGIN, pos[a][1]))
+                pos[b][0] = min(CANVAS_WIDTH - MARGIN, max(MARGIN, pos[b][0]))
+                pos[b][1] = min(CANVAS_HEIGHT - MARGIN, max(MARGIN, pos[b][1]))
+        if not moved:
+            break
 
 
 def arrange_isolated(isolated_site_ids: list, top_y: float) -> dict:

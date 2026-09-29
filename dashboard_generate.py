@@ -1054,20 +1054,29 @@ def build_site_map_data(conn) -> dict:
     sites have qualifying inter-site connections, the deduplicated edge
     list, and per-site display metadata.
 
-    Two distinct edge sources, each deduplicated by the actual DEVICE
-    pair (not just the site pair) before being aggregated into a site
-    pair count - a physical connection recorded from BOTH ends' own
-    scans (once each site has scanned the other) is the same real
-    connection, not two:
-      - CDP: any links row where the two devices belong to different
-        real sites (Unassigned is excluded - it isn't a real site to
-        map, same as everywhere else in the dashboard).
-      - Tunnel: matched tunnel_links rows (device_b_id set) whose two
-        devices belong to different real sites. A ONE-SIDED tunnel
-        (device_b_id NULL - see match_tunnels()'s own docstring) has
-        no known far end to draw an edge to, so it's counted per
-        origin site instead and surfaced as a marker on that site's
-        own node, not as a dangling edge.
+    Tunnel-only edges (CDP-derived cross-site links deliberately left
+    out - see below). Deduplicated by the actual DEVICE pair (not just
+    the site pair) before being aggregated into a site-pair count - a
+    physical tunnel recorded from BOTH ends' own scans (once each site
+    has scanned the other) is the same real connection, not two.
+    Matched tunnel_links rows (device_b_id set) whose two devices
+    belong to different real sites become an edge. A ONE-SIDED tunnel
+    (device_b_id NULL - see match_tunnels()'s own docstring) has no
+    known far end to draw an edge to, so it's counted per origin site
+    instead and surfaced as a marker on that site's own node, not as a
+    dangling edge.
+
+    CDP cross-site links are NOT drawn here (deliberately dropped,
+    per Cadence - this map only ever shows one node per SITE, and a
+    CDP link is a specific DEVICE-to-DEVICE cable; on a site-level map
+    that just reads as a same-strength edge between two sites that
+    might have one link or forty, without ever showing the thing that
+    would actually explain it - the individual devices and cabling.
+    That's exactly what the per-site topology diagrams already show.
+    Tunnels are different: a GRE tunnel genuinely IS a site-to-site
+    concept (it's how one whole site reaches another over the WAN), so
+    it belongs on a site-level map in a way a CDP cable between two
+    specific switches doesn't).
     """
     real_sites = db.get_all_sites(conn, include_unassigned=False)
     real_site_ids = {s["id"] for s in real_sites}
@@ -1077,27 +1086,6 @@ def build_site_map_data(conn) -> dict:
         device_counts[s["id"]] = conn.execute(
             "SELECT COUNT(*) AS c FROM devices WHERE site_id = ?", (s["id"],)
         ).fetchone()["c"]
-
-    cdp_rows = conn.execute(
-        """
-        SELECT l.device_a_id, l.device_b_id, da.site_id AS site_a_id, db_.site_id AS site_b_id
-        FROM links l
-        JOIN devices da ON l.device_a_id = da.id
-        JOIN devices db_ ON l.device_b_id = db_.id
-        WHERE da.site_id != db_.site_id AND da.deleted_at IS NULL AND db_.deleted_at IS NULL
-        """
-    ).fetchall()
-    cdp_device_pairs = {}
-    for row in cdp_rows:
-        if row["site_a_id"] not in real_site_ids or row["site_b_id"] not in real_site_ids:
-            continue  # e.g. the other end is filed under Unassigned - not a real site to map
-        key = frozenset((row["device_a_id"], row["device_b_id"]))
-        cdp_device_pairs[key] = (row["site_a_id"], row["site_b_id"])
-
-    cdp_site_pair_counts = {}
-    for site_a_id, site_b_id in cdp_device_pairs.values():
-        key = frozenset((site_a_id, site_b_id))
-        cdp_site_pair_counts[key] = cdp_site_pair_counts.get(key, 0) + 1
 
     tunnel_rows = db.get_all_tunnel_links(conn)
     tunnel_device_pairs = {}
@@ -1136,9 +1124,6 @@ def build_site_map_data(conn) -> dict:
         tunnel_site_pair_names.setdefault(key, set()).update(tunnel_device_pair_names.get(dev_key, ()))
 
     edges = []
-    for pair_key, count in cdp_site_pair_counts.items():
-        site_a_id, site_b_id = tuple(pair_key)
-        edges.append({"site_a_id": site_a_id, "site_b_id": site_b_id, "kind": "cdp", "count": count})
     for pair_key, count in tunnel_site_pair_counts.items():
         site_a_id, site_b_id = tuple(pair_key)
         edges.append({
@@ -1203,7 +1188,6 @@ def render_site_map_page(conn) -> str:
 
     connected_count = len(data["connected_site_ids"])
     isolated_count = len(data["isolated_site_ids"])
-    cdp_edge_count = sum(1 for e in data["edges"] if e["kind"] == "cdp")
     tunnel_edge_count = sum(1 for e in data["edges"] if e["kind"] == "tunnel")
     generated_at = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 
@@ -1211,8 +1195,10 @@ def render_site_map_page(conn) -> str:
     if isolated_count:
         isolated_note = (
             f'<p style="padding:0 14px 14px; font-family:var(--mono); font-size:11.5px; color:var(--text-dim);">'
-            f'{isolated_count} site(s) below have no known CDP or tunnel connection to any other site - '
-            f'shown in a fixed grid, not part of the force-directed layout above (see legend).</p>'
+            f'{isolated_count} site(s) below have no known matched tunnel to any other site - '
+            f'shown in a fixed grid, not part of the force-directed layout above (see legend). '
+            f'CDP-derived cross-site links are not shown on this map - see each sites own page for its '
+            f'device-level topology.</p>'
         )
 
     return f'''<!DOCTYPE html>
@@ -1274,7 +1260,7 @@ footer{{ margin-top:20px; font-family:var(--mono); font-size:11px; color:var(--t
   <header>
     <div>
       <h1>All-Site Map</h1>
-      <div class="subtitle">{connected_count} connected \u00b7 {isolated_count} isolated \u00b7 {cdp_edge_count} CDP link(s) \u00b7 {tunnel_edge_count} tunnel link(s) \u00b7 generated {generated_at}</div>
+      <div class="subtitle">{connected_count} connected \u00b7 {isolated_count} isolated \u00b7 {tunnel_edge_count} tunnel link(s) \u00b7 generated {generated_at}</div>
     </div>
     <div class="header-actions">
       <button class="icon-btn" id="theme-toggle" title="Toggle theme">\U0001F319</button>
@@ -1293,7 +1279,6 @@ footer{{ margin-top:20px; font-family:var(--mono); font-size:11px; color:var(--t
       <div class="map-hint">Scroll to zoom · drag to pan</div>
     </div>
     <div class="legend">
-      <div class="legend-item"><span class="legend-swatch"></span>CDP-discovered link</div>
       <div class="legend-item"><span class="legend-swatch tunnel"></span>Matched tunnel</div>
       <div class="legend-item"><span class="legend-dot up"></span>Recently scanned</div>
       <div class="legend-item"><span class="legend-dot stale"></span>Not recently scanned</div>
