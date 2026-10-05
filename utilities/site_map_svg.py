@@ -5,9 +5,11 @@ site_map_layout.py the same way topology_svg.py is separate from
 topology_layout.py: that module is pure position math with no idea
 what a pixel is, this one decides what things look like.
 
-Each site is drawn as a circle (radius scaled gently by device count,
-not a fixed size - a 40-device hub site and a 2-device closet
-shouldn't look identical) with its name/octet labeled below it, and a
+Each site is drawn as a circle (radius scaled gently by device count
+AND by how many tunnel connections it has, not a fixed size - a
+40-device hub site and a 2-device closet shouldn't look identical, and
+neither should the site six tunnels terminate at and a site with just
+one quiet tunnel out) with its name/octet labeled below it, and a
 small colored ring/status matching the same up/stale convention used
 everywhere else in the dashboard (index page's site-list dot,
 per-site device staleness). Every node is a real link to that site's
@@ -31,8 +33,16 @@ surfaced instead of hidden in the first place).
 """
 
 MIN_RADIUS = 10
-MAX_RADIUS = 28
+MAX_RADIUS = 32
 RADIUS_PER_DEVICE = 0.35
+# How much a site's total tunnel-connection weight (see
+# dashboard_generate.build_site_map_data()'s "connection_weight") adds
+# to its node size, on top of device count. A site with a lot of
+# devices but only one quiet tunnel to somewhere shouldn't look like a
+# hub; a site that's the meeting point for a dozen tunnels should -
+# this is what makes the SECOND one actually read as more important
+# at a glance, not just "has a lot of devices".
+RADIUS_PER_CONNECTION = 1.1
 
 LABEL_FONT_SIZE = 10.5
 SUB_FONT_SIZE = 9
@@ -42,8 +52,9 @@ def _esc(s) -> str:
     return "" if s is None else str(s).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
-def _radius_for(device_count: int) -> float:
-    return min(MAX_RADIUS, max(MIN_RADIUS, MIN_RADIUS + device_count * RADIUS_PER_DEVICE))
+def _radius_for(device_count: int, connection_weight: int = 0) -> float:
+    raw = MIN_RADIUS + device_count * RADIUS_PER_DEVICE + connection_weight * RADIUS_PER_CONNECTION
+    return min(MAX_RADIUS, max(MIN_RADIUS, raw))
 
 
 def render_svg(layout_positions: dict, isolated_positions: dict, edges: list, site_meta: dict,
@@ -96,7 +107,7 @@ def render_svg(layout_positions: dict, isolated_positions: dict, edges: list, si
     nodes_svg = []
     for site_id, (x, y) in all_positions.items():
         meta = site_meta[site_id]
-        r = _radius_for(meta["device_count"])
+        r = _radius_for(meta["device_count"], meta.get("connection_weight", 0))
         status_cls = f"site-node-{meta['status']}" if meta["status"] != "none" else "site-node-none"
         warn_marker = ""
         if meta.get("one_sided_tunnels"):

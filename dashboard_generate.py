@@ -1140,6 +1140,17 @@ def build_site_map_data(conn) -> dict:
         connected_site_ids.add(edge["site_b_id"])
     isolated_site_ids = real_site_ids - connected_site_ids
 
+    # Total edge weight touching each site - same quantity
+    # site_map_layout.compute_layout() derives for itself (to decide
+    # hub spacing/alignment), computed again here for site_map_svg's
+    # node-sizing instead of threading it through the layout call.
+    # Cheap to redo and keeps the two modules independently correct
+    # rather than one silently depending on the other's internals.
+    connection_weight = {}
+    for edge in edges:
+        connection_weight[edge["site_a_id"]] = connection_weight.get(edge["site_a_id"], 0) + edge["count"]
+        connection_weight[edge["site_b_id"]] = connection_weight.get(edge["site_b_id"], 0) + edge["count"]
+
     site_meta = {}
     for s in real_sites:
         if not s["last_cdp_discovery"]:
@@ -1153,6 +1164,7 @@ def build_site_map_data(conn) -> dict:
             "octet": s["site_octet"],
             "href": f"site-{s['site_octet']}.html",
             "device_count": device_counts[s["id"]],
+            "connection_weight": connection_weight.get(s["id"], 0),
             "status": status,
             "one_sided_tunnels": one_sided_counts.get(s["id"], 0),
         }
@@ -1197,7 +1209,7 @@ def render_site_map_page(conn) -> str:
             f'<p style="padding:0 14px 14px; font-family:var(--mono); font-size:11.5px; color:var(--text-dim);">'
             f'{isolated_count} site(s) below have no known matched tunnel to any other site - '
             f'shown in a fixed grid, not part of the force-directed layout above (see legend). '
-            f'CDP-derived cross-site links are not shown on this map - see each sites own page for its '
+            f'CDP-derived cross-site links aren’t shown on this map - see each site’s own page for its '
             f'device-level topology.</p>'
         )
 

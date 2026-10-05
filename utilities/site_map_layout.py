@@ -78,6 +78,22 @@ SEPARATION_PASSES = 40
 # them).
 HUB_REPULSION_STRENGTH = 0.35
 
+# Gentle Y-axis-only pull between well-connected node pairs - see the
+# big comment where this is used, in the main loop, for the reasoning.
+# This compounds over ITERATIONS=300 passes, so it climbs to a
+# dead-straight line MUCH faster than the number itself suggests - in
+# testing against a 3-hub/18-leaf layout, measuring how tightly the
+# hubs' Y-coordinates cluster together (0 = no pull at all):
+#   0.0005 -> still loose, barely different from no pull
+#   0.001   -> noticeably closer, clearly not coincidence, still varied
+#   0.002   -> tight grouping, starting to look deliberate
+#   0.004+  -> essentially a straight line
+# Set conservatively in that "noticeably closer, still varied" range.
+# Raise it in small steps (0.0005 at a time) and look at the actual
+# rendered map each time - it moves faster than it looks like it
+# should.
+HUB_ALIGNMENT_STRENGTH = 0.001
+
 
 def _connected_components(node_ids, edges):
     """Plain union-find - only used to decide initial placement offsets
@@ -200,6 +216,31 @@ def compute_layout(site_ids: list, edges: list) -> dict:
                 disp[b][0] -= fx
                 disp[b][1] -= fy
 
+        # Hub alignment: a gentle pull-together on the Y axis only,
+        # between every pair of nodes, scaled by BOTH nodes' weight -
+        # so it's negligible for two ordinary leaves (small weight on
+        # both sides), noticeable between two hubs (large weight on
+        # both sides), and in between for a hub/leaf pair. This is
+        # deliberately soft rather than a hard "put every hub on one
+        # exact line" constraint - a rigid line would fight the
+        # organic, settled-into-place look of the rest of the map, and
+        # would need its own separate logic to keep hubs from
+        # overlapping each other along that line. A gentle bias lets
+        # hubs drift toward roughly the same height over the course of
+        # the simulation while everything else about their position
+        # (X spacing, distance from their own leaves) is still decided
+        # by the normal forces above. HUB_ALIGNMENT_STRENGTH is the
+        # knob - 0 turns this off entirely.
+        if HUB_ALIGNMENT_STRENGTH:
+            for i, a in enumerate(site_ids):
+                for b in site_ids[i + 1:]:
+                    pull = HUB_ALIGNMENT_STRENGTH * weight[a] * weight[b]
+                    if pull == 0:
+                        continue
+                    dy = pos[b][1] - pos[a][1]
+                    disp[a][1] += dy * pull
+                    disp[b][1] -= dy * pull
+
         # Attraction: along each edge, scaled by how many real
         # connections it represents (a site pair with 3 matched
         # tunnels pulls a bit tighter than a single lone one).
@@ -218,22 +259,74 @@ def compute_layout(site_ids: list, edges: list) -> dict:
             disp[b][0] += fx
             disp[b][1] += fy
 
-        # Apply displacement, capped by the current temperature, then
-        # clamp inside the canvas margins.
+        # Apply displacement, capped by the current temperature. No
+        # per-axis clamping to the canvas edges here on purpose - see
+        # the big comment above the main loop for why (it's what used
+        # to produce the "rectangle border" look). A generous safety
+        # bound (several canvas-widths out) still applies, purely to
+        # stop numerical blow-up on pathological input; it should
+        # never actually be reached in practice.
+        safety_bound = max(CANVAS_WIDTH, CANVAS_HEIGHT) * 4
         for site_id in site_ids:
             dx, dy = disp[site_id]
             dist = max(0.01, (dx * dx + dy * dy) ** 0.5)
             capped = min(dist, temperature)
             pos[site_id][0] += (dx / dist) * capped
             pos[site_id][1] += (dy / dist) * capped
-            pos[site_id][0] = min(CANVAS_WIDTH - MARGIN, max(MARGIN, pos[site_id][0]))
-            pos[site_id][1] = min(CANVAS_HEIGHT - MARGIN, max(MARGIN, pos[site_id][1]))
+            pos[site_id][0] = min(safety_bound, max(-safety_bound, pos[site_id][0]))
+            pos[site_id][1] = min(safety_bound, max(-safety_bound, pos[site_id][1]))
 
         temperature = max(1.0, temperature - cooling)
 
+    _fit_to_canvas(pos, site_ids)
     _enforce_min_separation(pos, site_ids, rng)
 
     return {"positions": {site_id: (x, y) for site_id, (x, y) in pos.items()}}
+
+
+def _fit_to_canvas(pos: dict, site_ids: list) -> None:
+    """Rescales and re-centers the whole settled layout to fill the
+    canvas (within MARGIN on every side), preserving its actual shape
+    and aspect ratio rather than clamping each axis independently.
+
+    This runs once, after the force simulation has fully settled, in
+    place of clamping node-by-node on every iteration - clamping
+    mid-simulation is what used to flatten any node pushed toward an
+    edge onto a straight line at that edge, so several outward nodes
+    together read as a crisp rectangle instead of the graph's actual
+    (organic, irregular) outer boundary. Letting the physics run
+    unconstrained and only fitting the *result* into the canvas
+    afterward keeps whatever shape the graph actually settled into.
+    Mutates `pos` in place.
+    """
+    if not site_ids:
+        return
+    xs = [pos[s][0] for s in site_ids]
+    ys = [pos[s][1] for s in site_ids]
+    min_x, max_x = min(xs), max(xs)
+    min_y, max_y = min(ys), max(ys)
+    span_x = max(1.0, max_x - min_x)
+    span_y = max(1.0, max_y - min_y)
+
+    avail_w = CANVAS_WIDTH - 2 * MARGIN
+    avail_h = CANVAS_HEIGHT - 2 * MARGIN
+    # Single uniform scale (not independent x/y scales) so the shape
+    # isn't stretched out of proportion - whichever axis is tighter
+    # relative to its available space decides the scale, same idea as
+    # "letterboxing" an image into a frame.
+    scale = min(avail_w / span_x, avail_h / span_y)
+
+    # Center the scaled shape within the canvas, rather than pinning
+    # it to the MARGIN corner - keeps it visually balanced regardless
+    # of the graph's actual aspect ratio.
+    scaled_w = span_x * scale
+    scaled_h = span_y * scale
+    offset_x = MARGIN + (avail_w - scaled_w) / 2.0
+    offset_y = MARGIN + (avail_h - scaled_h) / 2.0
+
+    for site_id in site_ids:
+        pos[site_id][0] = offset_x + (pos[site_id][0] - min_x) * scale
+        pos[site_id][1] = offset_y + (pos[site_id][1] - min_y) * scale
 
 
 def _enforce_min_separation(pos: dict, site_ids: list, rng: random.Random) -> None:
