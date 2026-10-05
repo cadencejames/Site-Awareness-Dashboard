@@ -280,6 +280,28 @@ def _device_is_stale(device_row, site_last_cdp_discovery) -> bool:
     return _is_stale(device_row["last_seen"], site_last_cdp_discovery) or device_row["marked_stale_at"] is not None
 
 
+def device_stale_reason(device_row, site_last_cdp_discovery):
+    """WHY a device counts as stale, using exactly the same two rules
+    as _device_is_stale() (which this must always agree with - it is
+    the single definition of "stale" for devices, shared with the Site
+    Manager tab in gui.py so the two can't drift apart):
+      None                 - not stale
+      "marked"             - flagged by hand (Mark Stale button) only
+      "not seen"           - age-based only (last_seen fell behind the
+                             site's last CDP scan by the threshold)
+      "marked + not seen"  - both
+    """
+    aged = _is_stale(device_row["last_seen"], site_last_cdp_discovery)
+    marked = device_row["marked_stale_at"] is not None
+    if aged and marked:
+        return "marked + not seen"
+    if aged:
+        return "not seen"
+    if marked:
+        return "marked"
+    return None
+
+
 def _client_is_stale(client_row, site_last_mac_table_collection) -> bool:
     """A client is stale if it wasn't seen on the site's most recent
     MAC-table collection (last_mac_table_collection, NOT

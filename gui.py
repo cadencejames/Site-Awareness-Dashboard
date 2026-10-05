@@ -153,6 +153,197 @@ class DevicePickerDialog(tk.Toplevel):
         self.destroy()
 
 
+def format_merge_summary(summary: dict) -> list:
+    """Plain-text lines describing what db.merge_devices() did (or, for
+    a dry run, would do). Zero-count rows are left out so the preview
+    stays short - most merges only touch a few of these tables.
+    """
+    lines = []
+
+    def add(label, **parts):
+        shown = [f"{n} {word}" for word, n in parts.items() if n]
+        if shown:
+            lines.append(f"  {label}: " + ", ".join(shown))
+
+    add("IP addresses", moved=summary["ips_moved"], **{"already known (merged)": summary["ips_merged"]})
+    add("Links", moved=summary["links_moved"], **{"merged into an existing link": summary["links_merged"],
+                                                  "dropped (between the two devices)": summary["links_dropped"]})
+    add("ARP entries", repointed=summary["arp_moved"])
+    add("Clients", repointed=summary["clients_moved"])
+    add("MAC table", moved=summary["mac_tables_moved"], **{"merged (newer kept)": summary["mac_tables_merged"]})
+    add("Tunnel interfaces", moved=summary["tunnel_interfaces_moved"],
+        **{"merged (newer kept)": summary["tunnel_interfaces_merged"]})
+    if summary["tunnel_links_cleared"] or summary["tunnel_interfaces_moved"] or summary["tunnel_interfaces_merged"]:
+        lines.append("  Tunnel pairings: rebuilt from the merged interfaces")
+    if summary["fields_filled"]:
+        lines.append(f"  Blank fields filled from the duplicate: {', '.join(summary['fields_filled'])}")
+    if summary["seed_transferred"]:
+        lines.append("  CDP seed role moves to the surviving device")
+    if summary["arp_seed_transferred"]:
+        lines.append("  ARP seed role moves to the surviving device")
+    if not lines:
+        lines.append("  (nothing is attached to the duplicate - it is simply removed)")
+    return lines
+
+
+class MergeDevicesDialog(tk.Toplevel):
+    """Modal dialog: merge the selected (duplicate) device INTO another
+    device at the same site. Pick the target from the list, choose
+    which hostname survives, review the preview, confirm.
+
+    The preview is a real dry run of db.merge_devices() (it does the
+    exact work, then rolls back), so it can't disagree with what the
+    actual merge does.
+
+    Sets self.result to (target_device_row, keep_hostname) where
+    keep_hostname is "target" or "duplicate", or None if cancelled.
+    """
+
+    def __init__(self, parent, duplicate, candidates: list):
+        super().__init__(parent)
+        self.title("Merge device")
+        self.result = None
+        self._duplicate = duplicate
+        self._candidates = {str(d["id"]): d for d in candidates}
+        self._target = None
+        self.transient(parent)
+        self.grab_set()
+
+        ttk.Label(
+            self,
+            text=f"Merge  '{duplicate['hostname']}'  (the duplicate - it will be removed)  into which device?",
+            padding=(12, 12, 12, 4),
+        ).pack(anchor="w")
+
+        filter_row = ttk.Frame(self, padding=(12, 0, 12, 4))
+        filter_row.pack(fill="x")
+        ttk.Label(filter_row, text="Filter:").pack(side="left")
+        self._filter_var = tk.StringVar()
+        self._filter_var.trace_add("write", lambda *_: self._populate())
+        ttk.Entry(filter_row, textvariable=self._filter_var).pack(side="left", fill="x", expand=True, padx=(6, 0))
+
+        list_frame = ttk.Frame(self, padding=(12, 0, 12, 8))
+        list_frame.pack(fill="both", expand=True)
+        list_frame.rowconfigure(0, weight=1)
+        list_frame.columnconfigure(0, weight=1)
+        self.tree = ttk.Treeview(
+            list_frame, columns=("hostname", "ip", "platform", "source", "seen"),
+            show="headings", height=8, selectmode="browse",
+        )
+        for col, text, width in (("hostname", "Hostname", 190), ("ip", "IP", 105), ("platform", "Platform", 150),
+                                 ("source", "Source", 90), ("seen", "Last seen", 130)):
+            self.tree.heading(col, text=text)
+            self.tree.column(col, width=width, anchor="w")
+        self.tree.grid(row=0, column=0, sticky="nsew")
+        scroll = ttk.Scrollbar(list_frame, orient="vertical", command=self.tree.yview)
+        self.tree.configure(yscrollcommand=scroll.set)
+        scroll.grid(row=0, column=1, sticky="ns")
+        self.tree.bind("<<TreeviewSelect>>", self._on_target_selected)
+
+        keep_frame = ttk.LabelFrame(self, text="Hostname to keep", padding=8)
+        keep_frame.pack(fill="x", padx=12, pady=(0, 8))
+        self._keep_var = tk.StringVar(value="target")
+        self._keep_var.trace_add("write", lambda *_: self._refresh_preview())
+        self.radio_target = ttk.Radiobutton(keep_frame, text="(select a target above)", value="target", variable=self._keep_var)
+        self.radio_target.pack(anchor="w")
+        self.radio_dup = ttk.Radiobutton(
+            keep_frame, text=f"'{duplicate['hostname']}' (the duplicate's name - the target is renamed)",
+            value="duplicate", variable=self._keep_var,
+        )
+        self.radio_dup.pack(anchor="w")
+        ttk.Label(
+            keep_frame,
+            text="Either way, the name that isn't kept is remembered as an alias, so a later scan or import that\n"
+                 "reports it lands on the surviving device instead of re-creating the duplicate.",
+            foreground="#666666",
+        ).pack(anchor="w", pady=(4, 0))
+
+        preview_frame = ttk.LabelFrame(self, text="What will happen (dry run - nothing is changed yet)", padding=8)
+        preview_frame.pack(fill="both", expand=True, padx=12, pady=(0, 8))
+        self.preview = tk.Text(preview_frame, width=78, height=11, wrap="word", state="disabled")
+        self.preview.pack(fill="both", expand=True)
+
+        button_row = ttk.Frame(self, padding=(12, 0, 12, 12))
+        button_row.pack(fill="x")
+        ttk.Button(button_row, text="Cancel", command=self._on_cancel).pack(side="right", padx=(6, 0))
+        self.btn_merge = ttk.Button(button_row, text="Merge", command=self._on_merge, state="disabled")
+        self.btn_merge.pack(side="right")
+
+        self._populate()
+        self._set_preview("Select the device to merge into.")
+        self.protocol("WM_DELETE_WINDOW", self._on_cancel)
+        self.wait_window(self)
+
+    def _populate(self):
+        needle = self._filter_var.get().strip().lower()
+        for row in self.tree.get_children():
+            self.tree.delete(row)
+        for iid, d in self._candidates.items():
+            haystack = " ".join(str(d[k] or "") for k in ("hostname", "mgmt_ip", "platform")).lower()
+            if needle and needle not in haystack:
+                continue
+            self.tree.insert("", "end", iid=iid, values=(
+                d["hostname"], d["mgmt_ip"] or "-", d["platform"] or "-", d["source"] or "-",
+                (d["last_seen"] or "-")[:19].replace("T", " "),
+            ))
+        if self._target is not None and str(self._target["id"]) in self.tree.get_children():
+            self.tree.selection_set(str(self._target["id"]))
+
+    def _set_preview(self, text: str):
+        self.preview.configure(state="normal")
+        self.preview.delete("1.0", "end")
+        self.preview.insert("1.0", text)
+        self.preview.configure(state="disabled")
+
+    def _on_target_selected(self, event=None):
+        selection = self.tree.selection()
+        if not selection:
+            return
+        self._target = self._candidates[selection[0]]
+        self.radio_target.configure(text=f"'{self._target['hostname']}' (the target's name - recommended if it's the real, canonical name)")
+        self._refresh_preview()
+
+    def _refresh_preview(self):
+        if self._target is None:
+            return
+        try:
+            with db.get_conn() as conn:
+                summary = db.merge_devices(
+                    conn, self._duplicate["id"], self._target["id"], keep_hostname=self._keep_var.get(), dry_run=True,
+                )
+        except Exception as e:  # noqa: BLE001 - show it in the preview rather than crash the dialog
+            self.btn_merge.configure(state="disabled")
+            self._set_preview(f"Can't merge these two:\n\n{e}")
+            return
+        header = (
+            f"'{summary['duplicate_hostname']}' will be merged into '{summary['target_hostname']}' "
+            f"and removed.\nThe surviving device will be named '{summary['final_hostname']}'.\n\nMoving:"
+        )
+        footer = (
+            "\n\nThe duplicate's manual stale mark is not carried over, and the survivor's last-seen time becomes "
+            "the newer of the two."
+        )
+        self._set_preview(header + "\n" + "\n".join(format_merge_summary(summary)) + footer)
+        self.btn_merge.configure(state="normal")
+
+    def _on_merge(self):
+        if self._target is None:
+            return
+        if not messagebox.askyesno(
+            "Merge device",
+            f"Permanently merge '{self._duplicate['hostname']}' into '{self._target['hostname']}'?\n\n"
+            "The duplicate's row is deleted (not just hidden). Back up sad.db first if you haven't.",
+            parent=self,
+        ):
+            return
+        self.result = (self._target, self._keep_var.get())
+        self.destroy()
+
+    def _on_cancel(self):
+        self.result = None
+        self.destroy()
+
+
 class SiteManagerTab(ttk.Frame):
     """Manual, per-site bookkeeping: name/code a site, flag its CDP
     seed device (and, if different, its ARP seed or a device's ARP
@@ -255,8 +446,10 @@ class SiteManagerTab(ttk.Frame):
         self.btn_delete_device.grid(row=0, column=2, sticky="e", padx=(0, 6))
         self.btn_mark_stale = ttk.Button(devices_header, text="Mark Stale", command=self._toggle_mark_stale, state="disabled")
         self.btn_mark_stale.grid(row=0, column=3, sticky="e", padx=(0, 6))
+        self.btn_merge = ttk.Button(devices_header, text="Merge Into...", command=self._merge_device, state="disabled")
+        self.btn_merge.grid(row=0, column=4, sticky="e", padx=(0, 6))
         self.btn_open_ssh = ttk.Button(devices_header, text="Open SSH", command=self._open_ssh, state="disabled")
-        self.btn_open_ssh.grid(row=0, column=4, sticky="e")
+        self.btn_open_ssh.grid(row=0, column=5, sticky="e")
 
         device_frame = ttk.Frame(right)
         device_frame.grid(row=3, column=0, sticky="nsew", pady=(4, 0))
@@ -270,8 +463,9 @@ class SiteManagerTab(ttk.Frame):
         self.device_tree.heading("override", text="ARP Override")
         self.device_tree.column("hostname", width=200, anchor="w")
         self.device_tree.column("ip", width=110, anchor="w")
-        self.device_tree.column("role", width=130, anchor="w")
+        self.device_tree.column("role", width=240, anchor="w")
         self.device_tree.column("override", width=110, anchor="w")
+        self.device_tree.tag_configure("stale", foreground="#b45309")
         self.device_tree.grid(row=0, column=0, sticky="nsew")
         self.device_tree.bind("<<TreeviewSelect>>", self._on_device_selected)
         self._enable_sorting(self.device_tree, {
@@ -345,6 +539,7 @@ class SiteManagerTab(ttk.Frame):
         self.selected_device = None
         self.btn_open_ssh.configure(state="disabled")
         self.btn_delete_device.configure(state="disabled")
+        self.btn_merge.configure(state="disabled")
         self.btn_mark_stale.configure(state="disabled", text="Mark Stale")
 
     def refresh_devices(self):
@@ -353,18 +548,30 @@ class SiteManagerTab(ttk.Frame):
             return
         with db.get_conn() as conn:
             devices = db.get_devices_for_site(conn, self.selected_site["id"])
+            # Fresh read, not self.selected_site: that row is a snapshot
+            # from the last refresh_sites(), so its last_cdp_discovery
+            # goes out of date the moment a discovery run finishes.
+            site_row = db.get_site_by_id(conn, self.selected_site["id"])
+        site_last_scan = site_row["last_cdp_discovery"] if site_row else None
         for d in devices:
             roles = []
             if d["is_seed"]:
                 roles.append("CDP seed")
             if d["is_arp_seed"]:
                 roles.append("ARP seed")
-            if d["marked_stale_at"]:
-                roles.append("STALE")
+            # Same definition of "stale" as the dashboard's tile (see
+            # dashboard_generate.device_stale_reason) - this used to
+            # show only the manual flag, so the age-based ones were
+            # invisible here even though the dashboard counted them.
+            stale_reason = dashboard_generate.device_stale_reason(d, site_last_scan)
+            if stale_reason:
+                roles.append(f"STALE ({stale_reason})")
             iid = str(d["id"])
-            self.device_tree.insert("", "end", iid=iid, values=(
-                d["hostname"], d["mgmt_ip"] or "-", ", ".join(roles), d["arp_override_ip"] or "-",
-            ))
+            self.device_tree.insert(
+                "", "end", iid=iid,
+                values=(d["hostname"], d["mgmt_ip"] or "-", ", ".join(roles), d["arp_override_ip"] or "-"),
+                tags=("stale",) if stale_reason else (),
+            )
             self._devices_by_iid[iid] = d
 
     def _on_device_selected(self, event=None):
@@ -373,11 +580,13 @@ class SiteManagerTab(ttk.Frame):
             self.selected_device = None
             self.btn_open_ssh.configure(state="disabled")
             self.btn_delete_device.configure(state="disabled")
+            self.btn_merge.configure(state="disabled")
             self.btn_mark_stale.configure(state="disabled", text="Mark Stale")
             return
         self.selected_device = self._devices_by_iid[selection[0]]
         self.btn_open_ssh.configure(state="normal")
         self.btn_delete_device.configure(state="normal")
+        self.btn_merge.configure(state="normal")
         self.btn_mark_stale.configure(
             state="normal",
             text="Clear Stale" if self.selected_device["marked_stale_at"] else "Mark Stale",
@@ -680,6 +889,46 @@ class SiteManagerTab(ttk.Frame):
                 "Open SSH",
                 "Could not launch PowerShell/ssh - make sure ssh.exe is installed and on PATH.",
             )
+
+    def _merge_device(self):
+        """Merge the selected device (the duplicate) INTO another device
+        at the same site - see db.merge_devices() for exactly what moves
+        and MergeDevicesDialog for the preview/confirm flow. Goes
+        through the write queue like every other write here.
+        """
+        if self.selected_device is None or self.selected_site is None:
+            return
+        duplicate = self.selected_device
+        with db.get_conn() as conn:
+            candidates = [d for d in db.get_devices_for_site(conn, self.selected_site["id"]) if d["id"] != duplicate["id"]]
+        if not candidates:
+            messagebox.showinfo("Merge Into...", "There's no other device at this site to merge into.")
+            return
+        dialog = MergeDevicesDialog(self, duplicate, candidates)
+        if dialog.result is None:
+            return
+        target, keep_hostname = dialog.result
+        target_id = target["id"]  # captured before refresh_devices() clears the selection
+        try:
+            applied, summary = write_queue.queue_and_apply(
+                "merge_devices", duplicate_id=duplicate["id"], target_id=target_id, keep_hostname=keep_hostname,
+            )
+        except RuntimeError as e:
+            messagebox.showerror("Merge Into...", str(e))
+            return
+        if not applied:
+            messagebox.showinfo("Merge Into...", "Queued - the write queue is busy, this will apply shortly.")
+        else:
+            detail = "\n".join(format_merge_summary(summary))
+            messagebox.showinfo(
+                "Merge Into...",
+                f"Merged '{summary['duplicate_hostname']}' into '{summary['final_hostname']}'.\n\n{detail}",
+            )
+        self.refresh_devices()
+        iid = str(target_id)
+        if iid in self._devices_by_iid:
+            self.device_tree.selection_set(iid)
+            self._on_device_selected()
 
     def _toggle_mark_stale(self):
         """Manually flag (or clear) the selected device as stale -

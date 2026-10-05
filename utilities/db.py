@@ -287,11 +287,31 @@ CREATE TABLE IF NOT EXISTS tunnel_links (
     UNIQUE(device_a_id, device_a_interface)
 );
 
+-- Remembers the OTHER name of a device that was merged away (see
+-- merge_devices()). Devices are keyed by exact (site_id, hostname), so
+-- after merging a CDP-discovered "SW-01.corp.example" into an
+-- inventory-known "sw-01", the very next CDP walk would report
+-- "SW-01.corp.example" again and silently create the duplicate all
+-- over again. An alias row says "this name at this site is really that
+-- device" - upsert_device()/get_device_*_by_hostname() consult it only
+-- when no real device has the exact name. COLLATE NOCASE because
+-- case-only differences are one of the most common ways these
+-- duplicates arise in the first place.
+CREATE TABLE IF NOT EXISTS device_aliases (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    site_id    INTEGER NOT NULL REFERENCES sites(id),
+    device_id  INTEGER NOT NULL REFERENCES devices(id),
+    hostname   TEXT NOT NULL COLLATE NOCASE,
+    created_at TEXT,
+    UNIQUE(site_id, hostname)
+);
+
 CREATE INDEX IF NOT EXISTS idx_devices_site   ON devices(site_id);
 CREATE INDEX IF NOT EXISTS idx_devices_serial ON devices(serial_number);
 CREATE INDEX IF NOT EXISTS idx_links_site     ON links(site_id);
 CREATE INDEX IF NOT EXISTS idx_arp_site       ON arp_entries(site_id);
 CREATE INDEX IF NOT EXISTS idx_device_ips_device ON device_ips(device_id);
+CREATE INDEX IF NOT EXISTS idx_device_aliases_device ON device_aliases(device_id);
 CREATE INDEX IF NOT EXISTS idx_tunnel_interfaces_site   ON tunnel_interfaces(site_id);
 CREATE INDEX IF NOT EXISTS idx_tunnel_interfaces_device ON tunnel_interfaces(device_id);
 CREATE INDEX IF NOT EXISTS idx_tunnel_links_device_a    ON tunnel_links(device_a_id);
@@ -719,6 +739,28 @@ def mark_site_tunnel_run(conn, site_id: int) -> None:
 # Devices
 # ---------------------------------------------------------------------
 
+def _resolve_alias_hostname(conn, site_id: int, hostname: str):
+    """If `hostname` is NOT the exact name of a real device at this
+    site but IS a recorded alias (left behind by merge_devices()),
+    return the canonical hostname of the device it points at. Returns
+    None otherwise - including whenever a real device already has this
+    exact name, which always wins over an alias.
+    """
+    if conn.execute(
+        "SELECT 1 FROM devices WHERE site_id = ? AND hostname = ?", (site_id, hostname)
+    ).fetchone():
+        return None
+    row = conn.execute(
+        """
+        SELECT d.hostname FROM device_aliases a
+        JOIN devices d ON d.id = a.device_id
+        WHERE a.site_id = ? AND a.hostname = ?
+        """,
+        (site_id, hostname),
+    ).fetchone()
+    return row["hostname"] if row else None
+
+
 def upsert_device(
     conn,
     site_id: int,
@@ -744,6 +786,13 @@ def upsert_device(
     inventory-known device would silently overwrite trusted data with
     whatever CDP happens to report about it.
     """
+    # A name left behind by a past merge resolves to the surviving
+    # device instead of creating the duplicate again (see
+    # device_aliases in SCHEMA).
+    canonical = _resolve_alias_hostname(conn, site_id, hostname)
+    if canonical is not None:
+        hostname = canonical
+
     existing = conn.execute(
         "SELECT source FROM devices WHERE site_id = ? AND hostname = ?", (site_id, hostname)
     ).fetchone()
@@ -930,6 +979,9 @@ def get_device_id_by_hostname(conn, site_id: int, hostname: str):
     risking an upsert overwriting fields you don't have fresh data for.
     Returns None if not found.
     """
+    canonical = _resolve_alias_hostname(conn, site_id, hostname)
+    if canonical is not None:
+        hostname = canonical
     row = conn.execute(
         "SELECT id FROM devices WHERE site_id = ? AND hostname = ?", (site_id, hostname)
     ).fetchone()
@@ -942,6 +994,9 @@ def get_device_by_hostname(conn, site_id: int, hostname: str):
     the id (e.g. the orchestrator's platform-substring connection
     fast-path, which needs the device's known platform too).
     """
+    canonical = _resolve_alias_hostname(conn, site_id, hostname)
+    if canonical is not None:
+        hostname = canonical
     return conn.execute(
         "SELECT * FROM devices WHERE site_id = ? AND hostname = ?", (site_id, hostname)
     ).fetchone()
@@ -1622,7 +1677,264 @@ def delete_device(conn, device_id: int) -> None:
     or removed any device_ips/links/arp_entries referencing it first -
     foreign keys are enforced, so this raises if child rows remain.
     """
+    conn.execute("DELETE FROM device_aliases WHERE device_id = ?", (device_id,))
     conn.execute("DELETE FROM devices WHERE id = ?", (device_id,))
+
+
+# ---------------------------------------------------------------------
+# Device merge
+# ---------------------------------------------------------------------
+
+def _newest(*timestamps):
+    """Latest of several ISO-8601 timestamps (all produced by _now(), so
+    plain string comparison orders them correctly), ignoring None."""
+    present = [t for t in timestamps if t]
+    return max(present) if present else None
+
+
+def _merge_check(conn, duplicate_id: int, target_id: int):
+    dup = conn.execute("SELECT * FROM devices WHERE id = ?", (duplicate_id,)).fetchone()
+    tgt = conn.execute("SELECT * FROM devices WHERE id = ?", (target_id,)).fetchone()
+    if dup is None or tgt is None:
+        raise ValueError("One of the devices no longer exists - refresh and try again.")
+    if duplicate_id == target_id:
+        raise ValueError("Pick two different devices.")
+    if dup["site_id"] != tgt["site_id"]:
+        raise ValueError("Both devices must be at the same site.")
+    if dup["deleted_at"] or tgt["deleted_at"]:
+        raise ValueError("Can't merge a deleted device.")
+    return dup, tgt
+
+
+def merge_devices(conn, duplicate_id: int, target_id: int, keep_hostname: str = "target",
+                  dry_run: bool = False) -> dict:
+    """Merge a duplicate device INTO a target device (same site), then
+    remove the duplicate. The target is the survivor: its row, id and
+    seed/stale/etc. state stay; everything that pointed at the
+    duplicate is moved onto it.
+
+    What moves, table by table (every table that references
+    devices(id) is covered - foreign keys are enforced, so a missed one
+    would make the final delete fail and roll the whole merge back):
+      - device_ips: re-parented with last_seen preserved; an IP both
+        devices had keeps the higher-ranked source and newer last_seen.
+        Cached mgmt_ip is recomputed afterward.
+      - links: re-pointed onto the target. A link that becomes
+        equivalent to one the target already has (checked in BOTH
+        orientations, same as upsert_link()) is merged into it; a link
+        between the duplicate and the target themselves is dropped (a
+        device can't link to itself).
+      - arp_entries, clients: re-pointed.
+      - mac_table_raw (one row per device): the newer collection wins.
+      - tunnel_interfaces: re-pointed; same interface on both keeps the
+        newer. tunnel_links is DERIVED data, so rows owned by the
+        duplicate are cleared and match_tunnels() rebuilds from the
+        merged interfaces.
+      - device_aliases: any pointing at the duplicate move to the target.
+      - Target's own platform/serial_number/arp_override_ip are kept;
+        only blanks are filled from the duplicate. last_seen becomes the
+        newer of the two (which is what clears the "not seen" stale
+        flag). The duplicate's manual stale mark is NOT carried over.
+      - CDP/ARP seed flags transfer to the target if the duplicate held
+        them (and the sites.seed_device/arp_seed_device hostname mirrors
+        are kept in step with the final hostname).
+
+    keep_hostname: "target" (default) keeps the target's name;
+    "duplicate" renames the target to the duplicate's name. Either way
+    the name that is NOT kept is recorded in device_aliases, so the next
+    discovery/inventory run that reports it lands on the survivor
+    instead of re-creating the duplicate.
+
+    dry_run=True performs the exact same work and then ROLLS BACK the
+    connection's open transaction, returning the same summary - so a
+    preview can never disagree with the real thing. Use a dedicated
+    connection for it (anything else uncommitted on the connection is
+    rolled back too).
+
+    Returns a plain-JSON summary dict (counts per table, final
+    hostname, seed transfers, filled fields). Raises ValueError for a
+    bad pairing; any other failure propagates and, under get_conn(),
+    means nothing was committed.
+    """
+    if keep_hostname not in ("target", "duplicate"):
+        raise ValueError("keep_hostname must be 'target' or 'duplicate'.")
+    dup, tgt = _merge_check(conn, duplicate_id, target_id)
+    site_id = tgt["site_id"]
+    dup_name, tgt_name = dup["hostname"], tgt["hostname"]
+
+    summary = {
+        "duplicate_hostname": dup_name, "target_hostname": tgt_name,
+        "final_hostname": tgt_name if keep_hostname == "target" else dup_name,
+        "ips_moved": 0, "ips_merged": 0,
+        "links_moved": 0, "links_merged": 0, "links_dropped": 0,
+        "arp_moved": 0, "clients_moved": 0,
+        "mac_tables_moved": 0, "mac_tables_merged": 0,
+        "tunnel_interfaces_moved": 0, "tunnel_interfaces_merged": 0, "tunnel_links_cleared": 0,
+        "fields_filled": [], "seed_transferred": False, "arp_seed_transferred": False,
+        "dry_run": bool(dry_run),
+    }
+
+    # --- device_ips ---
+    tgt_ips = {r["ip"]: r for r in conn.execute("SELECT * FROM device_ips WHERE device_id = ?", (target_id,))}
+    for r in conn.execute("SELECT * FROM device_ips WHERE device_id = ?", (duplicate_id,)).fetchall():
+        existing = tgt_ips.get(r["ip"])
+        if existing is None:
+            conn.execute("UPDATE device_ips SET device_id = ? WHERE id = ?", (target_id, r["id"]))
+            summary["ips_moved"] += 1
+            continue
+        newest = _newest(existing["last_seen"], r["last_seen"])
+        if _source_rank(r["source"]) > _source_rank(existing["source"]):
+            conn.execute(
+                "UPDATE device_ips SET source = ?, raw_source_data = ?, last_seen = ? WHERE id = ?",
+                (r["source"], r["raw_source_data"], newest, existing["id"]),
+            )
+        else:
+            conn.execute("UPDATE device_ips SET last_seen = ? WHERE id = ?", (newest, existing["id"]))
+        conn.execute("DELETE FROM device_ips WHERE id = ?", (r["id"],))
+        summary["ips_merged"] += 1
+    _refresh_cached_mgmt_ip(conn, target_id)
+
+    # --- links ---
+    for link in conn.execute(
+        "SELECT * FROM links WHERE device_a_id = ? OR device_b_id = ?", (duplicate_id, duplicate_id)
+    ).fetchall():
+        a = target_id if link["device_a_id"] == duplicate_id else link["device_a_id"]
+        b = target_id if link["device_b_id"] == duplicate_id else link["device_b_id"]
+        if a == b:
+            conn.execute("DELETE FROM links WHERE id = ?", (link["id"],))
+            summary["links_dropped"] += 1
+            continue
+        equivalent = conn.execute(
+            """
+            SELECT id, last_seen FROM links
+            WHERE id != ? AND site_id = ? AND (
+                (device_a_id = ? AND device_b_id = ?
+                  AND IFNULL(local_intf, '') = IFNULL(?, '') AND IFNULL(remote_intf, '') = IFNULL(?, ''))
+             OR (device_a_id = ? AND device_b_id = ?
+                  AND IFNULL(local_intf, '') = IFNULL(?, '') AND IFNULL(remote_intf, '') = IFNULL(?, ''))
+            )
+            """,
+            (link["id"], link["site_id"],
+             a, b, link["local_intf"], link["remote_intf"],
+             b, a, link["remote_intf"], link["local_intf"]),
+        ).fetchone()
+        if equivalent is not None:
+            conn.execute(
+                "UPDATE links SET last_seen = ? WHERE id = ?",
+                (_newest(equivalent["last_seen"], link["last_seen"]), equivalent["id"]),
+            )
+            conn.execute("DELETE FROM links WHERE id = ?", (link["id"],))
+            summary["links_merged"] += 1
+        else:
+            conn.execute("UPDATE links SET device_a_id = ?, device_b_id = ? WHERE id = ?", (a, b, link["id"]))
+            summary["links_moved"] += 1
+
+    # --- arp_entries / clients ---
+    summary["arp_moved"] = conn.execute(
+        "UPDATE arp_entries SET device_id = ? WHERE device_id = ?", (target_id, duplicate_id)
+    ).rowcount
+    summary["clients_moved"] = conn.execute(
+        "UPDATE clients SET device_id = ? WHERE device_id = ?", (target_id, duplicate_id)
+    ).rowcount
+
+    # --- mac_table_raw (UNIQUE(device_id)) ---
+    dup_mt = conn.execute("SELECT * FROM mac_table_raw WHERE device_id = ?", (duplicate_id,)).fetchone()
+    if dup_mt is not None:
+        tgt_mt = conn.execute("SELECT * FROM mac_table_raw WHERE device_id = ?", (target_id,)).fetchone()
+        if tgt_mt is None:
+            conn.execute("UPDATE mac_table_raw SET device_id = ? WHERE id = ?", (target_id, dup_mt["id"]))
+            summary["mac_tables_moved"] = 1
+        else:
+            if (dup_mt["collected_at"] or "") > (tgt_mt["collected_at"] or ""):
+                conn.execute("DELETE FROM mac_table_raw WHERE id = ?", (tgt_mt["id"],))
+                conn.execute("UPDATE mac_table_raw SET device_id = ? WHERE id = ?", (target_id, dup_mt["id"]))
+            else:
+                conn.execute("DELETE FROM mac_table_raw WHERE id = ?", (dup_mt["id"],))
+            summary["mac_tables_merged"] = 1
+
+    # --- tunnel_interfaces (UNIQUE(device_id, interface)) + derived tunnel_links ---
+    tgt_tunnels = {
+        r["interface"]: r
+        for r in conn.execute("SELECT * FROM tunnel_interfaces WHERE device_id = ?", (target_id,))
+    }
+    for r in conn.execute("SELECT * FROM tunnel_interfaces WHERE device_id = ?", (duplicate_id,)).fetchall():
+        existing = tgt_tunnels.get(r["interface"])
+        if existing is None:
+            conn.execute("UPDATE tunnel_interfaces SET device_id = ? WHERE id = ?", (target_id, r["id"]))
+            summary["tunnel_interfaces_moved"] += 1
+        else:
+            if (r["last_seen"] or "") > (existing["last_seen"] or ""):
+                conn.execute("DELETE FROM tunnel_interfaces WHERE id = ?", (existing["id"],))
+                conn.execute("UPDATE tunnel_interfaces SET device_id = ? WHERE id = ?", (target_id, r["id"]))
+            else:
+                conn.execute("DELETE FROM tunnel_interfaces WHERE id = ?", (r["id"],))
+            summary["tunnel_interfaces_merged"] += 1
+    summary["tunnel_links_cleared"] = conn.execute(
+        "DELETE FROM tunnel_links WHERE device_a_id = ?", (duplicate_id,)
+    ).rowcount
+    conn.execute("UPDATE tunnel_links SET device_b_id = ? WHERE device_b_id = ?", (target_id, duplicate_id))
+    conn.execute("DELETE FROM tunnel_links WHERE device_a_id = device_b_id")
+    if summary["tunnel_interfaces_moved"] or summary["tunnel_interfaces_merged"] or summary["tunnel_links_cleared"]:
+        match_tunnels(conn)
+
+    # --- aliases that pointed at the duplicate now point at the target ---
+    conn.execute("UPDATE device_aliases SET device_id = ? WHERE device_id = ?", (target_id, duplicate_id))
+
+    # --- fill the target's blanks; take the newer last_seen ---
+    updates = {}
+    for col in ("platform", "serial_number", "arp_override_ip"):
+        if not tgt[col] and dup[col]:
+            updates[col] = dup[col]
+            summary["fields_filled"].append(col)
+    newest_seen = _newest(tgt["last_seen"], dup["last_seen"])
+    if newest_seen != tgt["last_seen"]:
+        updates["last_seen"] = newest_seen
+    if updates:
+        set_clause = ", ".join(f"{col} = ?" for col in updates)
+        conn.execute(f"UPDATE devices SET {set_clause} WHERE id = ?", (*updates.values(), target_id))
+
+    # --- the duplicate is now childless: remove it (frees its name) ---
+    delete_device(conn, duplicate_id)
+
+    # --- final hostname + alias for whichever name is NOT kept ---
+    if keep_hostname == "duplicate":
+        conn.execute("UPDATE devices SET hostname = ? WHERE id = ?", (dup_name, target_id))
+        alias_name = tgt_name
+    else:
+        alias_name = dup_name
+    final_name = summary["final_hostname"]
+    conn.execute("DELETE FROM device_aliases WHERE site_id = ? AND hostname = ?", (site_id, final_name))
+    conn.execute(
+        """
+        INSERT INTO device_aliases (site_id, device_id, hostname, created_at) VALUES (?, ?, ?, ?)
+        ON CONFLICT(site_id, hostname) DO UPDATE SET device_id = excluded.device_id, created_at = excluded.created_at
+        """,
+        (site_id, target_id, alias_name, _now()),
+    )
+
+    # --- seed flags (and their hostname mirrors on sites) ---
+    if dup["is_seed"] and not tgt["is_seed"]:
+        set_device_as_seed(conn, site_id, target_id)
+        summary["seed_transferred"] = True
+    elif tgt["is_seed"] and final_name != tgt_name:
+        conn.execute("UPDATE sites SET seed_device = ? WHERE id = ?", (final_name, site_id))
+    if dup["is_arp_seed"] and not tgt["is_arp_seed"]:
+        set_device_as_arp_seed(conn, site_id, target_id)
+        summary["arp_seed_transferred"] = True
+    elif tgt["is_arp_seed"] and final_name != tgt_name:
+        conn.execute("UPDATE sites SET arp_seed_device = ? WHERE id = ?", (final_name, site_id))
+
+    site_row = conn.execute("SELECT site_octet FROM sites WHERE id = ?", (site_id,)).fetchone()
+    log_activity(
+        "merge_devices",
+        f"Merged '{dup_name}' into '{final_name}' (site {site_row['site_octet'] if site_row else site_id})"
+        + (" [dry run]" if dry_run else ""),
+        conn=conn,
+    )
+
+    if dry_run:
+        conn.rollback()
+    return summary
 
 
 # ---------------------------------------------------------------------
