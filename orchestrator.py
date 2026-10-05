@@ -587,6 +587,12 @@ def discover_site(site_row, creds: dict, connect_fn=None, session_log_dir: str =
 
         devices_touched += 1
 
+        # Reaching the device IS proof it is alive. Without this, only
+        # devices that show up as someone else's CDP neighbor ever got
+        # their last_seen refreshed - a one-device site aged out even
+        # though every run logged into it fine.
+        write_queue.queue_and_wait("touch_device_seen", device_id=current_device_id)
+
         if collect_mac_tables and mac_raw_output is not None:
             write_queue.queue_and_wait(
                 "stage_mac_table_raw",

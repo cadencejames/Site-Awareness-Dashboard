@@ -825,6 +825,19 @@ def upsert_device(
     return row["id"]
 
 
+def touch_device_seen(conn, device_id: int) -> None:
+    """Refresh a device's last_seen without touching anything else.
+
+    A CDP walk logs into each device it visits, but the only
+    last_seen refreshes it did were for NEIGHBORS (upsert_device on
+    each CDP entry). A device nobody else lists as a neighbor - the
+    only device at a one-device site, or one whose neighbors don't
+    report it - was reached successfully every run and still aged out.
+    The walk calls this for every device it actually connects to.
+    """
+    conn.execute("UPDATE devices SET last_seen = ? WHERE id = ?", (_now(), device_id))
+
+
 def get_devices_for_site(conn, site_id: int):
     return conn.execute(
         "SELECT * FROM devices WHERE site_id = ? AND deleted_at IS NULL ORDER BY hostname", (site_id,)

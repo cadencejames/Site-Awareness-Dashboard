@@ -134,6 +134,7 @@ ACTIONS = {
     "set_device_arp_override_ip": db.set_device_arp_override_ip,
     "set_device_marked_stale": db.set_device_marked_stale,
     "merge_devices": db.merge_devices,
+    "touch_device_seen": db.touch_device_seen,
     "auto_seed_singleton_sites": db.auto_seed_singleton_sites,
 
     # Raw discovery-time write functions. Unlike the actions above,
