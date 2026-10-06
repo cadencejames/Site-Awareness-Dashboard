@@ -914,17 +914,11 @@ def render_index_page(conn) -> str:
             "SELECT COUNT(*) AS c FROM devices WHERE site_id = ?", (unassigned_site["id"],)
         ).fetchone()["c"]
 
-    # Only counted for real sites - Unassigned has no last_cdp_discovery
-    # to compare against (it's never CDP-scanned), so nothing there can
-    # ever be judged stale by this rule.
-    stale_device_count = 0
-    for s in real_sites:
-        if not s["last_cdp_discovery"]:
-            continue
-        site_devices = conn.execute(
-            "SELECT last_seen, marked_stale_at FROM devices WHERE site_id = ?", (s["id"],)
-        ).fetchall()
-        stale_device_count += sum(1 for d in site_devices if _device_is_stale(d, s["last_cdp_discovery"]))
+    # The tile and the stale devices page share one definition
+    # (collect_stale_devices) so the count here always equals the
+    # number of rows on stale.html. Unassigned is never CDP-scanned, so
+    # nothing there can be judged stale by this rule.
+    stale_device_count = len(collect_stale_devices(conn, real_sites))
 
     rows_html = []
     for s in real_sites:
@@ -987,6 +981,8 @@ button:active, .btn:active{{ transform:scale(.97); }}
 .kpi .num{{ font-family:var(--mono); font-size:26px; font-weight:700; }}
 .kpi .num.warn{{ color:var(--warn); }}
 .kpi .label{{ font-family:var(--mono); font-size:11px; text-transform:uppercase; letter-spacing:.07em; color:var(--text-dim); margin-top:4px; }}
+.kpi-link{{ display:block; color:inherit; text-decoration:none; transition:border-color .15s ease; }}
+.kpi-link:hover{{ border-color:var(--accent); }}
 .search-row{{ margin-bottom:14px; }}
 #search{{ width:100%; background:var(--panel); border:1px solid var(--border); border-radius:8px; color:var(--text); font-family:var(--mono); font-size:13px; padding:10px 14px; }}
 #search::placeholder{{ color:var(--text-dim); }}
@@ -1033,7 +1029,7 @@ footer{{ margin-top:20px; font-family:var(--mono); font-size:11px; color:var(--t
     <div class="kpi"><center><div class="num">{total_links}</div><div class="label">Links</div></center></div>
     <div class="kpi"><center><div class="num">{total_clients}</div><div class="label">Clients</div></center></div>
     <div class="kpi"><center>{'<div class="num warn">' if never_scanned > 0 else '<div class="num">'}{never_scanned}</div><div class="label">Never CDP-scanned</div></center></div>
-    <div class="kpi"><center><div class="num warn">{stale_device_count}</div><div class="label">Stale devices</div></center></div>
+    <a class="kpi kpi-link" href="stale.html" title="Review stale devices"><center><div class="num warn">{stale_device_count}</div><div class="label">Stale devices</div></center></a>
   </div>
 
   <div class="search-row">
@@ -1064,6 +1060,297 @@ document.getElementById("search").addEventListener("input", (e) => {{
 </body>
 </html>
 '''
+
+
+# ---------------------------------------------------------------------
+# Stale devices page
+# ---------------------------------------------------------------------
+
+def _days_behind(last_seen, site_last_cdp_discovery):
+    """Whole days between a device's last_seen and the site's last CDP
+    scan (the same gap _is_stale() measures), or None when either side
+    is missing/unparseable."""
+    if not last_seen or not site_last_cdp_discovery:
+        return None
+    try:
+        seen_dt = datetime.datetime.fromisoformat(last_seen.replace("Z", "+00:00"))
+        scan_dt = datetime.datetime.fromisoformat(site_last_cdp_discovery.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return max(0, (scan_dt - seen_dt).days)
+
+
+def _hostname_key(hostname):
+    """Lowercased hostname with any domain suffix and trailing
+    "(SERIAL)" removed - 'SW-A(FOC123).corp.local' and 'sw-a' compare
+    equal. Only used to suggest merge candidates, never to decide
+    anything on its own."""
+    h = (hostname or "").strip().lower()
+    h = re.sub(r"\(.*?\)\s*", "", h)
+    return h.split(".")[0]
+
+
+def _names_look_related(a_key, b_key) -> bool:
+    if not a_key or not b_key:
+        return False
+    if a_key == b_key:
+        return True
+    short, long_ = sorted((a_key, b_key), key=len)
+    # 'sw1' vs 'sw1-core' (prefix then a separator), but never
+    # 'sw1' vs 'sw10'.
+    return len(short) >= 4 and long_.startswith(short) and not long_[len(short)].isalnum()
+
+
+def _duplicate_hint(stale_dev, fresh_devices, ips_by_device):
+    """Best guess at which NOT-stale device at the same site this stale
+    one is a duplicate of, or None. Returns (hostname, why). Evidence,
+    strongest first: same serial number, a shared IP, a related name.
+    """
+    my_ips = ips_by_device.get(stale_dev["id"], set())
+    my_key = _hostname_key(stale_dev["hostname"])
+    best = None
+    for other in fresh_devices:
+        if other["id"] == stale_dev["id"]:
+            continue
+        why = None
+        if stale_dev["serial_number"] and stale_dev["serial_number"] == other["serial_number"]:
+            why, score = "same serial number", 3
+        else:
+            shared = my_ips & ips_by_device.get(other["id"], set())
+            if shared:
+                why, score = f"shares IP {sorted(shared)[0]}", 2
+            elif _names_look_related(my_key, _hostname_key(other["hostname"])):
+                why, score = "similar name", 1
+        if why and (best is None or score > best[2]):
+            best = (other["hostname"], why, score)
+    return (best[0], best[1]) if best else None
+
+
+def collect_stale_devices(conn, real_sites) -> list:
+    """Every stale device across the given (real, non-Unassigned)
+    sites. THE shared definition behind both the index tile's count and
+    the stale devices page - the tile is len() of this - so the two
+    can't disagree. Live devices only; soft-deleted ones never count.
+    Sites that were never CDP-scanned are skipped (nothing to judge
+    against - see _is_stale()).
+
+    Returns a list of dicts, ordered by site then hostname.
+    """
+    out = []
+    for s in real_sites:
+        scan = s["last_cdp_discovery"]
+        if not scan:
+            continue
+        devices = db.get_devices_for_site(conn, s["id"])
+        reasons = {d["id"]: device_stale_reason(d, scan) for d in devices}
+        if not any(reasons.values()):
+            continue
+        ips_by_device = {}
+        for row in conn.execute(
+            "SELECT di.device_id, di.ip FROM device_ips di JOIN devices d ON d.id = di.device_id WHERE d.site_id = ?",
+            (s["id"],),
+        ):
+            ips_by_device.setdefault(row["device_id"], set()).add(row["ip"])
+        fresh = [d for d in devices if not reasons[d["id"]]]
+        label = s["site_name"] or f"(unset — octet {s['site_octet']})"
+        for d in devices:
+            reason = reasons[d["id"]]
+            if not reason:
+                continue
+            hint = _duplicate_hint(d, fresh, ips_by_device)
+            out.append({
+                "site_octet": s["site_octet"],
+                "site_label": label,
+                "site_total": len(devices),
+                "site_last_scan": scan,
+                "hostname": d["hostname"],
+                "mgmt_ip": d["mgmt_ip"],
+                "platform": d["platform"],
+                "source": d["source"],
+                "last_seen": d["last_seen"],
+                "days_behind": _days_behind(d["last_seen"], scan),
+                "reason": reason,
+                "duplicate_of": hint[0] if hint else None,
+                "duplicate_why": hint[1] if hint else None,
+            })
+    return out
+
+
+def render_stale_page(conn) -> str:
+    real_sites = [s for s in db.get_all_sites(conn) if s["site_octet"] != "unassigned"]
+    stale = collect_stale_devices(conn, real_sites)
+
+    by_site = {}
+    for d in stale:
+        by_site.setdefault(d["site_octet"], []).append(d)
+
+    panels = []
+    for octet, devs in by_site.items():
+        first = devs[0]
+        rows = []
+        for d in devs:
+            source_label = "inventory" if d["source"] == "inventory_sync" else _esc(d["source"])
+            source_cls = "source-inventory" if d["source"] == "inventory_sync" else "source-cdp"
+            behind = f"{d['days_behind']} d behind scan" if d["days_behind"] is not None else "—"
+            if d["duplicate_of"]:
+                dup = (
+                    f'<span class="badge dup" title="{_esc(d["duplicate_why"])}">'
+                    f'maybe a duplicate of {_esc(d["duplicate_of"])}</span>'
+                )
+            else:
+                dup = ""
+            rows.append(f'''
+      <div class="row" data-reason="{_esc(d['reason'])}" data-dup="{'1' if d['duplicate_of'] else '0'}">
+        <div class="main">
+          <div class="name">{_esc(d['hostname'])}</div>
+          <div class="meta">{_esc(d['mgmt_ip'] or '-')} · {_esc(d['platform'] or 'unknown platform')} · last seen {_fmt_ts(d['last_seen'])} · {behind}</div>
+        </div>
+        <div class="badges">
+          {dup}
+          <span class="badge {source_cls}">{source_label}</span>
+          <span class="badge reason">{_esc(d['reason'])}</span>
+        </div>
+      </div>''')
+        panels.append(f'''
+  <div class="panel site-panel">
+    <div class="panel-head">
+      <a class="site-link" href="site-{_esc(octet)}.html">{_esc(first['site_label'])} <span class="octet">octet {_esc(octet)}</span></a>
+      <span class="count">{len(devs)} of {first['site_total']} stale · last CDP scan {_fmt_ts(first['site_last_scan'])}</span>
+    </div>
+    {"".join(rows)}
+  </div>''')
+
+    dup_count = sum(1 for d in stale if d["duplicate_of"])
+    marked_count = sum(1 for d in stale if "marked" in d["reason"])
+    generated_at = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    if panels:
+        body = "".join(panels)
+    else:
+        body = '<p class="empty">No stale devices right now.</p>'
+
+    return f'''<!DOCTYPE html>
+<html lang="en" data-theme="light">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Stale Devices — Site Awareness Dashboard</title>
+<style>
+{CSS_TOKENS}
+*{{ box-sizing: border-box; }}
+body{{ margin:0; background:var(--bg); color:var(--text); font-family:var(--sans); -webkit-font-smoothing:antialiased; }}
+.wrap{{ max-width:1200px; margin:0 auto; padding:24px 24px 60px; }}
+a{{ color:inherit; }}
+.backlink{{ display:inline-block; font-family:var(--mono); font-size:12px; color:var(--text-dim); border:1px solid var(--border); border-radius:999px; padding:5px 12px; text-decoration:none; margin-bottom:14px; }}
+.backlink:hover{{ color:var(--accent); border-color:var(--accent); }}
+header{{ display:flex; justify-content:space-between; align-items:flex-end; border-bottom:2px solid var(--border); padding-bottom:16px; margin-bottom:20px; gap:16px; flex-wrap:wrap; }}
+header h1{{ margin:0; font-size:22px; font-weight:700; }}
+.subtitle{{ font-family:var(--mono); font-size:12px; color:var(--text-dim); margin-top:4px; }}
+button, .btn{{ background:var(--panel-2); border:1px solid var(--border); border-radius:8px; color:var(--text); font-family:var(--sans); font-size:13px; padding:8px 14px; cursor:pointer; text-decoration:none; display:inline-block; }}
+button:hover, .btn:hover{{ border-color:var(--accent); }}
+.icon-btn{{ width:38px; height:38px; padding:0; display:flex; align-items:center; justify-content:center; font-size:16px; }}
+.kpi-grid{{ display:grid; grid-template-columns:repeat(auto-fill, minmax(175px,1fr)); gap:12px; margin-bottom:20px; }}
+.kpi{{ background:var(--panel); border:1px solid var(--border); border-radius:var(--radius); padding:14px 16px; text-align:center; }}
+.kpi .num{{ font-family:var(--mono); font-size:26px; font-weight:700; }}
+.kpi .num.warn{{ color:var(--warn); }}
+.kpi .label{{ font-family:var(--mono); font-size:11px; text-transform:uppercase; letter-spacing:.07em; color:var(--text-dim); margin-top:4px; }}
+.controls{{ display:flex; gap:10px; margin-bottom:14px; flex-wrap:wrap; }}
+#search{{ flex:1; min-width:220px; background:var(--panel); border:1px solid var(--border); border-radius:8px; color:var(--text); font-family:var(--mono); font-size:13px; padding:10px 14px; }}
+#search:focus, #reason-filter:focus{{ outline:none; border-color:var(--accent); }}
+#reason-filter{{ background:var(--panel); border:1px solid var(--border); border-radius:8px; color:var(--text); font-family:var(--mono); font-size:13px; padding:10px 12px; }}
+.note{{ font-family:var(--mono); font-size:11.5px; color:var(--text-dim); margin:0 0 16px; line-height:1.5; }}
+.panel{{ background:var(--panel); border:1px solid var(--border); border-radius:var(--radius); overflow:hidden; margin-bottom:14px; }}
+.panel-head{{ background:var(--panel-2); border-bottom:1px solid var(--border); padding:8px 14px; display:flex; justify-content:space-between; align-items:center; gap:12px; flex-wrap:wrap; }}
+.site-link{{ font-size:13.5px; font-weight:700; text-decoration:none; }}
+.site-link:hover{{ color:var(--accent); }}
+.site-link .octet{{ font-family:var(--mono); font-size:11px; font-weight:400; color:var(--text-dim); margin-left:6px; }}
+.panel-head .count{{ font-family:var(--mono); font-size:11px; color:var(--text-dim); }}
+.row{{ display:flex; align-items:center; gap:14px; padding:10px 14px; border-bottom:1px solid var(--border); }}
+.row:last-child{{ border-bottom:none; }}
+.row .main{{ flex:1; min-width:0; }}
+.row .name{{ font-size:14px; font-weight:600; overflow-wrap:anywhere; }}
+.row .meta{{ font-family:var(--mono); font-size:11.5px; color:var(--text-dim); margin-top:2px; }}
+.badges{{ display:flex; gap:6px; flex:none; flex-wrap:wrap; justify-content:flex-end; }}
+.badge{{ font-family:var(--mono); font-size:10.5px; border-radius:999px; padding:2px 9px; white-space:nowrap; border:1px solid var(--border); }}
+.badge.source-inventory{{ color:var(--up); border-color:color-mix(in srgb, var(--up) 40%, var(--border)); }}
+.badge.source-cdp{{ color:var(--text-dim); }}
+.badge.reason{{ color:var(--warn); border-color:color-mix(in srgb, var(--warn) 40%, var(--border)); }}
+.badge.dup{{ color:var(--accent); border-color:var(--accent-dim); }}
+.empty{{ font-family:var(--mono); font-size:13px; color:var(--text-dim); padding:20px; text-align:center; }}
+footer{{ margin-top:20px; font-family:var(--mono); font-size:11px; color:var(--text-dim); text-align:center; }}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <a class="backlink" href="index.html">← All Sites</a>
+  <header>
+    <div>
+      <h1>Stale Devices</h1>
+      <div class="subtitle">{len(stale)} device(s) across {len(by_site)} site(s) · generated {generated_at}</div>
+    </div>
+    <button class="icon-btn" id="theme-toggle" title="Toggle theme">\U0001F319</button>
+  </header>
+
+  <div class="kpi-grid">
+    <div class="kpi"><div class="num warn">{len(stale)}</div><div class="label">Stale devices</div></div>
+    <div class="kpi"><div class="num">{len(by_site)}</div><div class="label">Sites affected</div></div>
+    <div class="kpi"><div class="num">{dup_count}</div><div class="label">Possible duplicates</div></div>
+    <div class="kpi"><div class="num">{marked_count}</div><div class="label">Marked by hand</div></div>
+  </div>
+
+  <p class="note">
+    "not seen" = the device's last-seen time is {STALE_THRESHOLD_DAYS}+ days behind its site's most recent CDP scan.
+    "marked" = flagged stale by hand in Site Manager. "Possible duplicate" is a hint only (same serial,
+    shared IP, or a similar name as a device at the same site that is NOT stale) - merge or delete from
+    the Site Manager tab in gui.py. This page is read-only.
+  </p>
+
+  <div class="controls">
+    <input id="search" type="text" placeholder="Filter by hostname, IP, platform, or site…" autocomplete="off">
+    <select id="reason-filter">
+      <option value="">All reasons</option>
+      <option value="not seen">Not seen</option>
+      <option value="marked">Marked (any)</option>
+      <option value="dup">Possible duplicates only</option>
+    </select>
+  </div>
+
+  <div id="panels">{body}</div>
+
+  <footer>Site Awareness Dashboard — generated from sad.db, read-only</footer>
+</div>
+<script>
+function applyFilters(){{
+  const f = document.getElementById("search").value.trim().toLowerCase();
+  const r = document.getElementById("reason-filter").value;
+  document.querySelectorAll(".site-panel").forEach(panel => {{
+    const siteText = panel.querySelector(".panel-head").textContent.toLowerCase();
+    let any = false;
+    panel.querySelectorAll(".row").forEach(row => {{
+      const reason = row.dataset.reason;
+      const okReason = !r || (r === "dup" ? row.dataset.dup === "1" : reason.includes(r));
+      const okText = !f || row.textContent.toLowerCase().includes(f) || siteText.includes(f);
+      const show = okReason && okText;
+      row.style.display = show ? "" : "none";
+      if(show) any = true;
+    }});
+    panel.style.display = any ? "" : "none";
+  }});
+}}
+document.getElementById("search").addEventListener("input", applyFilters);
+document.getElementById("reason-filter").addEventListener("change", applyFilters);
+{THEME_TOGGLE_JS}
+</script>
+</body>
+</html>
+'''
+
+
+def generate_stale_page(conn) -> str:
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    path = os.path.join(OUTPUT_DIR, "stale.html")
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(render_stale_page(conn))
+    return path
 
 
 # ---------------------------------------------------------------------
@@ -1735,6 +2022,8 @@ def generate_all(db_path: str = None):
         print(f"  Wrote {index_path}")
         clients_path = generate_client_search_page(conn)
         print(f"  Wrote {clients_path}")
+        stale_path = generate_stale_page(conn)
+        print(f"  Wrote {stale_path}")
         # Re-derived from every site's own links/tunnel_links each
         # time, same as the index page and client search - not
         # incrementally updatable, so it's always fully regenerated
@@ -1757,6 +2046,8 @@ def generate_one(site_key: str, db_path: str = None):
         print(f"  Wrote {index_path}")
         clients_path = generate_client_search_page(conn)
         print(f"  Wrote {clients_path}")
+        stale_path = generate_stale_page(conn)
+        print(f"  Wrote {stale_path}")
         # This one site's own cross-site links/tunnels can change the
         # all-site map too (a new inter-site edge, a newly-matched
         # tunnel) - regenerated alongside the index for the same
