@@ -766,6 +766,9 @@ button:hover, .btn:hover{{ border-color:var(--accent); }}
 button:active, .btn:active{{ transform:scale(.97); }}
 .header-actions{{ display:flex; gap:8px; align-items:center; }}
 .icon-btn{{ width:38px; height:38px; padding:0; display:flex; align-items:center; justify-content:center; font-size:16px; }}
+header.site-header{{ display:block; }}
+.title-row{{ display:flex; justify-content:space-between; align-items:center; gap:16px; }}
+.icon-btn-sm{{ width:30px; height:30px; font-size:13px; flex:none; }}
 .panel{{ background:var(--panel); border:1px solid var(--border); border-radius:var(--radius); overflow:hidden; margin-bottom:18px; }}
 .panel-head{{ background:var(--panel-2); border-bottom:1px solid var(--border); padding:8px 14px; display:flex; justify-content:space-between; align-items:center; cursor:pointer; list-style:none; }}
 .panel-head::-webkit-details-marker{{ display:none; }}
@@ -839,14 +842,12 @@ footer{{ margin-top:20px; font-family:var(--mono); font-size:11px; color:var(--t
 <body>
 <div class="wrap">
   <a class="backlink" href="index.html">\u2190 All Sites</a>
-  <header>
-    <div>
+  <header class="site-header">
+    <div class="title-row">
       <h1>{_esc(site_label)}{code_label}</h1>
-      <div class="subtitle">octet {_esc(site_row['site_octet'])} · CDP seed: {_esc(seed_label)} · ARP seed: {_esc(arp_seed_label)}{arp_override_note} · last CDP {_fmt_ts(site_row['last_cdp_discovery'])} · last ARP {_fmt_ts(site_row['last_arp_collection'])} · last tunnels {_fmt_ts(site_row['last_tunnel_collection'])}</div>
+      <button class="icon-btn icon-btn-sm" id="theme-toggle" title="Toggle theme">\U0001F319</button>
     </div>
-    <div class="header-actions">
-      <button class="icon-btn" id="theme-toggle" title="Toggle theme">\U0001F319</button>
-    </div>
+    <div class="subtitle">octet {_esc(site_row['site_octet'])} · CDP seed: {_esc(seed_label)} · ARP seed: {_esc(arp_seed_label)}{arp_override_note} · last CDP {_fmt_ts(site_row['last_cdp_discovery'])} · last ARP {_fmt_ts(site_row['last_arp_collection'])} · last tunnels {_fmt_ts(site_row['last_tunnel_collection'])}</div>
   </header>
 
   <details class="panel" open>
