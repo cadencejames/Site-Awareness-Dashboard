@@ -2,7 +2,7 @@
 dashboard_generate.py - Generates the static HTML dashboard (index page
 + one page per site) directly from sad.db. Reuses utilities/db.py for
 every query and utilities/topology_layout.py + topology_svg.py for the
-per-site topology diagram - no new query or layout logic lives here,
+per-site topology diagram - no new query or layout logic lives here,,
 this module is purely "fetch data, fill in HTML."
 
 Usage:
