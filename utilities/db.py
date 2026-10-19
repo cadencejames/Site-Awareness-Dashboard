@@ -1950,6 +1950,174 @@ def merge_devices(conn, duplicate_id: int, target_id: int, keep_hostname: str = 
     return summary
 
 
+def _site_label(site_row) -> str:
+    """'octet (name)' for messages and summaries."""
+    if site_row is None:
+        return "?"
+    name = site_row["site_name"]
+    return f"{site_row['site_octet']} ({name})" if name else str(site_row["site_octet"])
+
+
+def move_device_to_site(conn, device_id: int, dest_site_id: int, new_mgmt_ip: str = None,
+                        dry_run: bool = False) -> dict:
+    """Reassign a device to a different site - mainly for fixing devices
+    that discovery filed under Unassigned (often because they were first
+    seen via a WAN-facing IP whose octet matched no site).
+
+    What changes: devices.site_id; the device's name aliases follow it;
+    its seed flags (and the matching sites.seed_device/arp_seed_device
+    mirrors) are cleared at the OLD site, since a device can't seed a
+    site it no longer belongs to; and, if new_mgmt_ip is given, that
+    address is recorded as a MANUAL ip for the device (highest source
+    rank, so it becomes the primary address). The IPs the device already
+    had, e.g. the WAN address it was discovered with, are KEPT as lower-
+    ranked fallbacks - nothing is removed from device_ips.
+
+    What deliberately does NOT change: links, ARP entries, clients,
+    staged MAC tables and tunnel interfaces. Their site_id records the
+    site whose scan collected them (not where the device lives), and
+    they all reference the device by id, so they stay valid. A later
+    scan re-attributes anything that needs it.
+
+    Refuses (ValueError) when the destination already has a device with
+    this name, compared case-insensitively and including soft-deleted
+    rows, or a merge alias of that name: that is a duplicate to combine,
+    not a device to move.
+
+    dry_run=True does all the work and then ROLLS BACK, exactly like
+    merge_devices(), so a preview can't disagree with the real move.
+    Needs a dedicated connection for the same reason.
+
+    Returns a summary dict (see keys below).
+    """
+    dev = conn.execute("SELECT * FROM devices WHERE id = ?", (device_id,)).fetchone()
+    if dev is None or dev["deleted_at"]:
+        raise ValueError("That device no longer exists - refresh and try again.")
+    src_site = conn.execute("SELECT * FROM sites WHERE id = ?", (dev["site_id"],)).fetchone()
+    dest_site = get_site_by_id(conn, dest_site_id)
+    if dest_site is None:
+        raise ValueError("The destination site no longer exists - refresh and try again.")
+    if dest_site["id"] == dev["site_id"]:
+        raise ValueError("The device is already at that site.")
+
+    hostname = dev["hostname"]
+    dest_label = _site_label(dest_site)
+
+    ip = (new_mgmt_ip or "").strip() or None
+    if ip:
+        try:
+            ip = str(ipaddress.ip_address(ip))
+        except ValueError:
+            raise ValueError(f"'{new_mgmt_ip.strip()}' is not a valid IP address.") from None
+
+    clash = conn.execute(
+        "SELECT hostname, deleted_at FROM devices WHERE site_id = ? AND lower(hostname) = lower(?)",
+        (dest_site["id"], hostname),
+    ).fetchone()
+    if clash is not None:
+        if clash["deleted_at"]:
+            raise ValueError(
+                f"Site {dest_label} has a deleted device named '{clash['hostname']}', which still holds that name. "
+                f"Restore or purge it first."
+            )
+        raise ValueError(
+            f"Site {dest_label} already has a device named '{clash['hostname']}'. That looks like the same "
+            f"device, so the move was stopped instead of creating a duplicate."
+        )
+    alias_clash = conn.execute(
+        """
+        SELECT d.hostname FROM device_aliases a JOIN devices d ON d.id = a.device_id
+        WHERE a.site_id = ? AND a.hostname = ?
+        """,
+        (dest_site["id"], hostname),
+    ).fetchone()
+    if alias_clash is not None:
+        raise ValueError(
+            f"'{hostname}' is already a known alternate name of '{alias_clash['hostname']}' at site {dest_label}. "
+            f"That looks like the same device, so the move was stopped."
+        )
+
+    summary = {
+        "hostname": hostname,
+        "from_site": _site_label(src_site),
+        "to_site": dest_label,
+        "previous_ip": dev["mgmt_ip"],
+        "ip_added": ip,
+        "primary_ip": None,
+        "ip_is_primary": None,
+        "seeds_cleared": [],
+        "aliases_moved": 0,
+        "links_left": 0,
+        "clients_left": 0,
+        "arp_left": 0,
+        "dry_run": bool(dry_run),
+    }
+
+    # --- seed flags at the old site ---
+    if dev["is_seed"]:
+        conn.execute(
+            "UPDATE sites SET seed_device = NULL WHERE id = ? AND seed_device = ?", (dev["site_id"], hostname)
+        )
+        summary["seeds_cleared"].append("CDP seed")
+    if dev["is_arp_seed"]:
+        conn.execute(
+            "UPDATE sites SET arp_seed_device = NULL WHERE id = ? AND arp_seed_device = ?", (dev["site_id"], hostname)
+        )
+        summary["seeds_cleared"].append("ARP seed")
+
+    # --- the move itself ---
+    conn.execute(
+        "UPDATE devices SET site_id = ?, is_seed = 0, is_arp_seed = 0 WHERE id = ?",
+        (dest_site["id"], device_id),
+    )
+
+    # --- aliases follow the device (drop any same-named alias already at the destination first) ---
+    alias_rows = conn.execute("SELECT hostname FROM device_aliases WHERE device_id = ?", (device_id,)).fetchall()
+    for a in alias_rows:
+        conn.execute(
+            "DELETE FROM device_aliases WHERE site_id = ? AND hostname = ? AND device_id != ?",
+            (dest_site["id"], a["hostname"], device_id),
+        )
+    conn.execute("UPDATE device_aliases SET site_id = ? WHERE device_id = ?", (dest_site["id"], device_id))
+    summary["aliases_moved"] = len(alias_rows)
+
+    # --- management IP: add as manual (keeps every existing IP as a fallback) ---
+    if ip:
+        record_device_ip(
+            conn, device_id, ip, "manual",
+            raw_source_data=f"Set by hand when the device was moved to site {dest_label}",
+        )
+    else:
+        # The cached mgmt_ip's tie-breaker depends on the site's reference IP, which just changed.
+        _refresh_cached_mgmt_ip(conn, device_id)
+    primary = conn.execute("SELECT mgmt_ip FROM devices WHERE id = ?", (device_id,)).fetchone()["mgmt_ip"]
+    summary["primary_ip"] = primary
+    summary["ip_is_primary"] = (primary == ip) if ip else None
+
+    # --- what stays put (for the preview) ---
+    summary["links_left"] = conn.execute(
+        "SELECT COUNT(*) AS c FROM links WHERE device_a_id = ? OR device_b_id = ?", (device_id, device_id)
+    ).fetchone()["c"]
+    summary["clients_left"] = conn.execute(
+        "SELECT COUNT(*) AS c FROM clients WHERE device_id = ?", (device_id,)
+    ).fetchone()["c"]
+    summary["arp_left"] = conn.execute(
+        "SELECT COUNT(*) AS c FROM arp_entries WHERE device_id = ?", (device_id,)
+    ).fetchone()["c"]
+
+    log_activity(
+        "move_device",
+        f"Moved '{hostname}' from site {summary['from_site']} to site {dest_label}"
+        + (f"; added management IP {ip}" if ip else "")
+        + (" [dry run]" if dry_run else ""),
+        conn=conn,
+    )
+
+    if dry_run:
+        conn.rollback()
+    return summary
+
+
 # ---------------------------------------------------------------------
 # Tunnel interfaces / tunnel links
 # ---------------------------------------------------------------------

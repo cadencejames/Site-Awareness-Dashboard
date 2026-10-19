@@ -344,6 +344,166 @@ class MergeDevicesDialog(tk.Toplevel):
         self.destroy()
 
 
+def _site_choice_label(site) -> str:
+    """How a site is shown in the Move dialog's drop-down: 'octet - name'."""
+    return f"{site['site_octet']}  -  {site['site_name'] or '(unset)'}"
+
+
+def format_move_summary(summary: dict) -> list:
+    """Plain-language lines describing a db.move_device_to_site() result
+    - used for both the dry-run preview and the final confirmation."""
+    lines = [f"'{summary['hostname']}' moves from {summary['from_site']} to {summary['to_site']}.", ""]
+    if summary["ip_added"]:
+        lines.append(f"Management IP: {summary['ip_added']} is recorded as the manual address.")
+        if summary["ip_is_primary"]:
+            lines.append("It becomes the primary address, so discovery tries it first.")
+        else:
+            lines.append(
+                f"Another manually entered address still ranks higher, so {summary['primary_ip']} stays primary."
+            )
+        if summary["previous_ip"] and summary["previous_ip"] != summary["ip_added"]:
+            lines.append(f"The IP it had before ({summary['previous_ip']}) is kept as a fallback.")
+    else:
+        lines.append(f"Management IP: unchanged ({summary['primary_ip'] or 'none'}).")
+    if summary["seeds_cleared"]:
+        lines.append("")
+        lines.append(
+            f"It was the old site's {' and '.join(summary['seeds_cleared'])}; that site will have none set afterward."
+        )
+    if summary["aliases_moved"]:
+        lines.append(f"{summary['aliases_moved']} alternate name(s) from earlier merges move with it.")
+    lines.append("")
+    lines.append(
+        f"Stays where it is (still linked to the device): {summary['links_left']} link(s), "
+        f"{summary['clients_left']} client record(s), {summary['arp_left']} ARP entr"
+        f"{'y' if summary['arp_left'] == 1 else 'ies'}."
+    )
+    return lines
+
+
+class MoveDeviceDialog(tk.Toplevel):
+    """Modal dialog: choose the site to move a device to and, optionally,
+    correct its management IP (devices discovered under Unassigned are
+    often known only by a WAN-facing address). A live dry-run preview
+    shows exactly what the move will do - it runs the real
+    db.move_device_to_site() and rolls it back, so it cannot disagree
+    with the actual move.
+
+    Sets self.result to (destination_site_row, new_ip_or_None), or None
+    if cancelled. new_ip is None when the IP field was left as it was.
+    """
+
+    def __init__(self, parent, device, current_site, sites: list):
+        super().__init__(parent)
+        self.title("Move Device to Site")
+        self.result = None
+        self._device = device
+        self._sites = {_site_choice_label(s): s for s in sites}
+        self._dest = None
+        self._preview_job = None
+        self.transient(parent)
+        self.grab_set()
+        self.resizable(False, False)
+
+        ttk.Label(
+            self,
+            text=f"Move '{device['hostname']}' (currently at {_site_choice_label(current_site)}) to:",
+            padding=(12, 12, 12, 4),
+        ).pack(anchor="w")
+
+        self._site_var = tk.StringVar()
+        self.site_combo = ttk.Combobox(
+            self, textvariable=self._site_var, values=list(self._sites), state="readonly", width=60,
+        )
+        self.site_combo.pack(fill="x", padx=12)
+        self.site_combo.bind("<<ComboboxSelected>>", self._on_site_chosen)
+
+        ip_row = ttk.Frame(self, padding=(12, 10, 12, 0))
+        ip_row.pack(fill="x")
+        ttk.Label(ip_row, text="Management IP:").pack(side="left")
+        self._ip_var = tk.StringVar(value=device["mgmt_ip"] or "")
+        ip_entry = ttk.Entry(ip_row, textvariable=self._ip_var, width=20)
+        ip_entry.pack(side="left", padx=(8, 0))
+        self._ip_var.trace_add("write", lambda *_: self._schedule_preview())
+        ttk.Label(
+            self,
+            text=(
+                "Pre-filled with the IP it was discovered with. Replace it with the real management IP "
+                "if that is different; the current one is kept as a fallback."
+            ),
+            wraplength=480, justify="left", padding=(12, 4, 12, 0),
+        ).pack(anchor="w")
+
+        ttk.Label(self, text="What will happen", padding=(12, 10, 12, 2)).pack(anchor="w")
+        self.preview = tk.Text(self, width=64, height=11, wrap="word", state="disabled")
+        self.preview.pack(padx=12)
+        self._set_preview("Choose a destination site.")
+
+        button_row = ttk.Frame(self, padding=(12, 10, 12, 12))
+        button_row.pack(fill="x")
+        ttk.Button(button_row, text="Cancel", command=self._on_cancel).pack(side="right", padx=(6, 0))
+        self.btn_confirm = ttk.Button(button_row, text="Move", command=self._on_move, state="disabled")
+        self.btn_confirm.pack(side="right")
+
+        self.protocol("WM_DELETE_WINDOW", self._on_cancel)
+        self.wait_window(self)
+
+    def _set_preview(self, text: str):
+        self.preview.configure(state="normal")
+        self.preview.delete("1.0", "end")
+        self.preview.insert("1.0", text)
+        self.preview.configure(state="disabled")
+
+    def _new_ip_or_none(self):
+        """The IP to record, or None when the field is empty or still the device's current address."""
+        value = self._ip_var.get().strip()
+        if not value or value == (self._device["mgmt_ip"] or ""):
+            return None
+        return value
+
+    def _on_site_chosen(self, event=None):
+        self._dest = self._sites.get(self._site_var.get())
+        self._refresh_preview()
+
+    def _schedule_preview(self):
+        # Debounced - the IP field fires on every keystroke, and each preview is a real (rolled-back) DB pass.
+        if self._preview_job is not None:
+            self.after_cancel(self._preview_job)
+        self._preview_job = self.after(350, self._refresh_preview)
+
+    def _refresh_preview(self):
+        self._preview_job = None
+        if self._dest is None:
+            return
+        try:
+            with db.get_conn() as conn:
+                summary = db.move_device_to_site(
+                    conn, self._device["id"], self._dest["id"], new_mgmt_ip=self._new_ip_or_none(), dry_run=True,
+                )
+        except Exception as e:  # noqa: BLE001 - show it in the preview rather than crash the dialog
+            self.btn_confirm.configure(state="disabled")
+            self._set_preview(f"Can't move this device:\n\n{e}")
+            return
+        self._set_preview("\n".join(format_move_summary(summary)))
+        self.btn_confirm.configure(state="normal")
+
+    def _on_move(self):
+        if self._dest is None:
+            return
+        if not messagebox.askyesno(
+            "Move Device",
+            f"Move '{self._device['hostname']}' to {_site_choice_label(self._dest)}?",
+            parent=self,
+        ):
+            return
+        self.result = (self._dest, self._new_ip_or_none())
+        self.destroy()
+
+    def _on_cancel(self):
+        self.result = None
+        self.destroy()
+
+
 class SiteManagerTab(ttk.Frame):
     """Manual, per-site bookkeeping: name/code a site, flag its CDP
     seed device (and, if different, its ARP seed or a device's ARP
@@ -448,8 +608,10 @@ class SiteManagerTab(ttk.Frame):
         self.btn_mark_stale.grid(row=0, column=3, sticky="e", padx=(0, 6))
         self.btn_merge = ttk.Button(devices_header, text="Merge Into...", command=self._merge_device, state="disabled")
         self.btn_merge.grid(row=0, column=4, sticky="e", padx=(0, 6))
+        self.btn_move = ttk.Button(devices_header, text="Move to Site...", command=self._move_device, state="disabled")
+        self.btn_move.grid(row=0, column=5, sticky="e", padx=(0, 6))
         self.btn_open_ssh = ttk.Button(devices_header, text="Open SSH", command=self._open_ssh, state="disabled")
-        self.btn_open_ssh.grid(row=0, column=5, sticky="e")
+        self.btn_open_ssh.grid(row=0, column=6, sticky="e")
 
         device_frame = ttk.Frame(right)
         device_frame.grid(row=3, column=0, sticky="nsew", pady=(4, 0))
@@ -540,6 +702,7 @@ class SiteManagerTab(ttk.Frame):
         self.btn_open_ssh.configure(state="disabled")
         self.btn_delete_device.configure(state="disabled")
         self.btn_merge.configure(state="disabled")
+        self.btn_move.configure(state="disabled")
         self.btn_mark_stale.configure(state="disabled", text="Mark Stale")
 
     def refresh_devices(self):
@@ -581,12 +744,14 @@ class SiteManagerTab(ttk.Frame):
             self.btn_open_ssh.configure(state="disabled")
             self.btn_delete_device.configure(state="disabled")
             self.btn_merge.configure(state="disabled")
+            self.btn_move.configure(state="disabled")
             self.btn_mark_stale.configure(state="disabled", text="Mark Stale")
             return
         self.selected_device = self._devices_by_iid[selection[0]]
         self.btn_open_ssh.configure(state="normal")
         self.btn_delete_device.configure(state="normal")
         self.btn_merge.configure(state="normal")
+        self.btn_move.configure(state="normal")
         self.btn_mark_stale.configure(
             state="normal",
             text="Clear Stale" if self.selected_device["marked_stale_at"] else "Mark Stale",
@@ -929,6 +1094,38 @@ class SiteManagerTab(ttk.Frame):
         if iid in self._devices_by_iid:
             self.device_tree.selection_set(iid)
             self._on_device_selected()
+
+    def _move_device(self):
+        """Move the selected device to a different site (mainly: out of
+        Unassigned), optionally correcting its management IP - see
+        db.move_device_to_site() for exactly what moves and what stays,
+        and MoveDeviceDialog for the preview/confirm flow. Goes through
+        the write queue like every other write here.
+        """
+        if self.selected_device is None or self.selected_site is None:
+            return
+        device = self.selected_device
+        with db.get_conn() as conn:
+            sites = [s for s in db.get_all_sites(conn) if s["id"] != device["site_id"]]
+        if not sites:
+            messagebox.showinfo("Move to Site", "There's no other site to move this device to.")
+            return
+        dialog = MoveDeviceDialog(self, device, self.selected_site, sites)
+        if dialog.result is None:
+            return
+        dest, new_ip = dialog.result
+        try:
+            applied, summary = write_queue.queue_and_apply(
+                "move_device_to_site", device_id=device["id"], dest_site_id=dest["id"], new_mgmt_ip=new_ip,
+            )
+        except RuntimeError as e:
+            messagebox.showerror("Move to Site", str(e))
+            return
+        if not applied:
+            messagebox.showinfo("Move to Site", "Queued - the write queue is busy, this will apply shortly.")
+        else:
+            messagebox.showinfo("Move to Site", "\n".join(format_move_summary(summary)))
+        self.refresh_devices()
 
     def _toggle_mark_stale(self):
         """Manually flag (or clear) the selected device as stale -
