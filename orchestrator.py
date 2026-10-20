@@ -1,11 +1,14 @@
 """
 orchestrator.py - Top-level entry point for Site Awareness Dashboard
-data collection. Two actions are available per site:
+data collection. Actions available per site:
 
     cdp - walk CDP outward from the site's seed device, writing
           discovered devices/links into the DB as source='cdp'
     arp - connect to the site's ARP seed device, discover any VRFs,
           and pull the global + per-VRF ARP tables into arp_entries
+    configs - connect to every device already in the DB for the site
+          (no CDP walk) and store its running-config as a snapshot
+          when it changed since the last pull
 
 Usage (CLI - runs immediately, no prompts beyond the credential
 password):
@@ -47,6 +50,7 @@ import arp_parser  # noqa: E402
 import vrf_parser  # noqa: E402
 import mac_parser  # noqa: E402
 import tunnel_parser  # noqa: E402
+import config_parser  # noqa: E402
 
 
 # How many sites run_for_sites() will scan at once. Bounded rather than
@@ -58,6 +62,10 @@ import tunnel_parser  # noqa: E402
 # this if real-world timing suggests a different number works better;
 # nothing else in this file assumes a specific value.
 DISCOVERY_MAX_WORKERS = 8
+
+# Seconds to wait for 'show running-config' to finish on one device. The
+# default Netmiko read timeout is far too short for a big chassis config.
+CONFIG_READ_TIMEOUT = 180
 
 
 # Substring match against a device's known platform string -> Netmiko
@@ -402,8 +410,10 @@ class _LiveSession:
     def __init__(self, netmiko_conn):
         self._conn = netmiko_conn
 
-    def run(self, command: str) -> str:
-        return self._conn.send_command(command)
+    def run(self, command: str, read_timeout: float = None) -> str:
+        if read_timeout is None:
+            return self._conn.send_command(command)
+        return self._conn.send_command(command, read_timeout=read_timeout)
 
     def close(self) -> None:
         self._conn.disconnect()
@@ -1099,9 +1109,87 @@ def collect_tunnels(site_row, creds: dict, open_session_fn=None, session_log_dir
     )
 
 
+def collect_configs(site_row, creds: dict, open_session_fn=None, session_log_dir: str = None, progress_cb=None,
+                    slot=None, include_stale: bool = False, only_device_ids=None) -> None:
+    """Pull `show running-config` from every live device already in the
+    DB for this site - no CDP walk, no seed device needed. Devices are
+    done one after another within the site (sites themselves run in
+    parallel via run_for_sites()). Each device gets its own session,
+    trying its ranked IPs in order.
+
+    Output is cleaned by config_parser.clean_config() (volatile header
+    lines stripped, last-change time/user parsed out); a pull that is
+    empty, rejected or cut off is recorded as a failure and NEVER
+    stored. A config identical to the newest stored snapshot only
+    refreshes the device's pull status, so the (large) text is queued
+    for writing only when it actually changed.
+
+    Aged-stale and manually-stale devices are skipped unless
+    include_stale. only_device_ids (optional set) limits the pull to
+    those devices - for a future single-device "pull now" button.
+    """
+    if open_session_fn is None:
+        def open_session_fn(ip_candidates, username, password, platform_hint=None):
+            return open_session(
+                ip_candidates, username, password, platform_hint=platform_hint, session_log_dir=session_log_dir,
+            )
+    username, password = _get_tacacs_credentials(creds)
+    octet = site_row["site_octet"]
+
+    with db.get_conn() as conn:
+        targets = db.get_config_targets(conn, site_row["id"], include_stale=include_stale)
+    if only_device_ids is not None:
+        targets = [t for t in targets if t["id"] in only_device_ids]
+    if not targets:
+        print(f"  Site {octet}: no devices to pull configs from.")
+        _report_progress(progress_cb, "status", octet, slot, "skipped", "Skipped - no devices to pull configs from")
+        return
+
+    stored = unchanged = failed = 0
+    for n, t in enumerate(targets, 1):
+        host = t["hostname"]
+        _report_progress(progress_cb, "status", octet, slot, "configs", f"Config {n}/{len(targets)}: {host}")
+        try:
+            if not t["ips"]:
+                raise ConnectionError("no known IP for this device")
+            session, used_ip = open_session_fn(t["ips"], username, password, t["platform"])
+            try:
+                raw = session.run("show running-config", read_timeout=CONFIG_READ_TIMEOUT)
+            finally:
+                session.close()
+            cleaned = config_parser.clean_config(raw)
+            if cleaned["problem"]:
+                raise ValueError(cleaned["problem"])
+            meta = {"changed_at": cleaned["changed_at"], "changed_by": cleaned["changed_by"],
+                    "nvram_updated": cleaned["nvram_updated"]}
+            if db.hash_config_text(cleaned["text"]) == t["latest_hash"]:
+                write_queue.queue_and_wait("record_config_pull_result", device_id=t["id"], ok=True, **meta)
+                unchanged += 1
+            else:
+                write_queue.queue_and_wait(
+                    "record_config_snapshot", device_id=t["id"], config_text=cleaned["text"], **meta,
+                )
+                stored += 1
+                print(f"    {host}: config changed - snapshot stored (via {used_ip})", flush=True)
+        except Exception as e:
+            failed += 1
+            print(f"    {host}: config pull failed: {e}", flush=True)
+            try:
+                write_queue.queue_and_wait("record_config_pull_result", device_id=t["id"], ok=False, error=str(e))
+            except Exception as e2:
+                print(f"    {host}: could not record the failure: {e2}", flush=True)
+
+    print(f"  Site {octet}: configs - {stored} new snapshot(s), {unchanged} unchanged, {failed} failed "
+          f"of {len(targets)} device(s).")
+    _report_progress(
+        progress_cb, "status", octet, slot, "configs",
+        f"Configs complete: {stored} changed / {unchanged} unchanged / {failed} failed",
+    )
+
+
 def _run_site_actions(site, actions: list, creds: dict, session_log_dir: str = None,
                        collect_mac_tables: bool = False, collect_tunnels_flag: bool = False,
-                       progress_cb=None, worker_slots=None) -> None:
+                       progress_cb=None, worker_slots=None, config_include_stale: bool = False) -> None:
     """One site's worth of work, pulled out into its own function so it
     can be handed to a thread-pool worker as-is. A site's own actions
     always run in the same strict order (CDP walk, then MAC
@@ -1141,12 +1229,17 @@ def _run_site_actions(site, actions: list, creds: dict, session_log_dir: str = N
     if collect_tunnels_flag:
         print("--- Tunnel collection ---")
         collect_tunnels(site, creds, session_log_dir=session_log_dir, progress_cb=progress_cb, slot=slot)
+    if "configs" in actions:
+        print("--- Config collection ---")
+        collect_configs(site, creds, session_log_dir=session_log_dir, progress_cb=progress_cb, slot=slot,
+                        include_stale=config_include_stale)
 
 
 def run_for_sites(sites: list, actions: list, creds: dict, session_log_dir: str = None,
                    collect_mac_tables: bool = False, collect_tunnels_flag: bool = False,
-                   max_workers: int = DISCOVERY_MAX_WORKERS, progress_cb=None) -> None:
-    """Run the given actions (any of 'cdp'/'arp') against each site,
+                   max_workers: int = DISCOVERY_MAX_WORKERS, progress_cb=None,
+                   config_include_stale: bool = False) -> None:
+    """Run the given actions (any of 'cdp'/'arp'/'configs') against each site,
     up to max_workers sites at a time. Shared by both the CLI and
     interactive-menu entry points so there's exactly one place that
     drives "for each site, do each action".
@@ -1220,6 +1313,7 @@ def run_for_sites(sites: list, actions: list, creds: dict, session_log_dir: str 
                 session_log_dir=session_log_dir, collect_mac_tables=collect_mac_tables,
                 collect_tunnels_flag=collect_tunnels_flag,
                 progress_cb=progress_cb, worker_slots=worker_slots,
+                config_include_stale=config_include_stale,
             ): site
             for site in sites
         }
@@ -1507,8 +1601,14 @@ def run_cli(argv: list) -> None:
     group.add_argument("--site", metavar="KEY", help="Run against one site (matches octet, name, or code)")
     group.add_argument("--all", action="store_true", help="Run against every site in the database")
     parser.add_argument(
-        "--action", choices=["cdp", "arp", "all"], required=True,
-        help="Which action to run: cdp discovery, arp collection, or all (both)",
+        "--action", choices=["cdp", "arp", "all", "configs"], required=True,
+        help="Which action to run: cdp discovery, arp collection, all (cdp + arp), or configs (pull running-configs "
+             "from devices already in the database; no CDP walk). 'all' does not include configs.",
+    )
+    parser.add_argument(
+        "--include-stale", action="store_true",
+        help="With --action configs: also pull from aged-stale / manually-stale devices (skipped by default, "
+             "since they are the most likely to time out).",
     )
     parser.add_argument(
         "--session-log", action="store_true",
@@ -1533,7 +1633,9 @@ def run_cli(argv: list) -> None:
             # never has a seed device, so scanning it is pure overhead
             # (picked up, immediately reports "no seed device
             # flagged", moves on) rather than a real site to discover.
-            sites = db.get_all_sites(conn, include_unassigned=False)
+            # (A config pull needs no seed device, so for --action configs
+            # the Unassigned site IS included - its devices are real.)
+            sites = db.get_all_sites(conn, include_unassigned=(args.action == "configs"))
         else:
             site = db.find_site_by_any_key(conn, args.site)
             if site is None:
@@ -1545,7 +1647,8 @@ def run_cli(argv: list) -> None:
         print("No sites found in the database.")
         return
 
-    run_for_sites(sites, actions, creds, session_log_dir=session_log_dir, collect_tunnels_flag=args.collect_tunnels)
+    run_for_sites(sites, actions, creds, session_log_dir=session_log_dir, collect_tunnels_flag=args.collect_tunnels,
+                  config_include_stale=args.include_stale)
 
 
 def run_menu() -> None:
@@ -1553,8 +1656,9 @@ def run_menu() -> None:
     print("(1) Run CDP discovery")
     print("(2) Run ARP collection")
     print("(3) Run both (CDP then ARP)")
+    print("(4) Collect running-configs (devices already in the database)")
     choice = input("Select action: ").strip()
-    action_map = {"1": ["cdp"], "2": ["arp"], "3": ["cdp", "arp"]}
+    action_map = {"1": ["cdp"], "2": ["arp"], "3": ["cdp", "arp"], "4": ["configs"]}
     actions = action_map.get(choice)
     if actions is None:
         print("Invalid choice.")
@@ -1574,7 +1678,7 @@ def run_menu() -> None:
 
     with db.get_conn() as conn:
         if scope_choice == "2":
-            sites = db.get_all_sites(conn, include_unassigned=False)
+            sites = db.get_all_sites(conn, include_unassigned=("configs" in actions))
         elif scope_choice == "1":
             key = input("Enter site octet, name, or code: ").strip()
             site = db.find_site_by_any_key(conn, key)

@@ -69,6 +69,7 @@ PHASE_STYLES = {
     "walking":     ("#ffe0b2", "#e65100", "Walking"),
     "correlating": ("#e1bee7", "#4a148c", "Correlating"),
     "arp":         ("#b2dfdb", "#00695c", "ARP"),
+    "configs":     ("#d7ccc8", "#4e342e", "Configs"),
     "done":        ("#c8e6c9", "#1b5e20", "Done"),
     "error":       ("#ffcdd2", "#b71c1c", "Error"),
     "skipped":     ("#eeeeee", "#616161", "Skipped"),
@@ -1551,6 +1552,8 @@ class DiscoveryTab(ttk.Frame):
                         command=self._on_action_changed).grid(row=1, column=3, sticky="w", pady=(8, 0))
         ttk.Radiobutton(controls, text="Generate dashboard", variable=self.action_var, value="dashboard",
                         command=self._on_action_changed).grid(row=1, column=4, sticky="w", pady=(8, 0))
+        ttk.Radiobutton(controls, text="Collect configs", variable=self.action_var, value="configs",
+                        command=self._on_action_changed).grid(row=1, column=5, sticky="w", pady=(8, 0))
 
         self.collect_mac_var = tk.BooleanVar(value=False)
         self.collect_mac_check = ttk.Checkbutton(
@@ -1573,7 +1576,7 @@ class DiscoveryTab(ttk.Frame):
         self.collect_tunnels_check.grid(row=3, column=1, columnspan=4, sticky="w", pady=(4, 0))
 
         self.run_button = ttk.Button(controls, text="Run", command=self._on_run_clicked)
-        self.run_button.grid(row=0, column=5, rowspan=2, sticky="ns", padx=(20, 0))
+        self.run_button.grid(row=0, column=6, rowspan=2, sticky="ns", padx=(20, 0))
 
         # Overall progress: how many of the sites in this run have
         # finished (successfully or not) - one determinate step per
@@ -1637,7 +1640,7 @@ class DiscoveryTab(ttk.Frame):
         # orchestrator.collect_tunnels()), so it's relevant for any
         # action that actually touches the network. Only "Generate
         # dashboard" (no network connection at all) disables it.
-        collect_tunnels_relevant = self.action_var.get() in ("cdp", "arp", "all")
+        collect_tunnels_relevant = self.action_var.get() in ("cdp", "arp", "all")  # not "configs"
         self.collect_tunnels_check.configure(state="normal" if collect_tunnels_relevant else "disabled")
 
     def _refresh_site_choices(self):
@@ -1906,7 +1909,8 @@ class DiscoveryTab(ttk.Frame):
                     # device, so including it in an "All sites" scan is
                     # pure overhead (picked up, immediately reports "no
                     # seed device flagged", moves on).
-                    sites = db.get_all_sites(conn, include_unassigned=False)
+                    # (Config collection needs no seed, so it keeps Unassigned.)
+                    sites = db.get_all_sites(conn, include_unassigned=("configs" in actions))
                 else:
                     # Looked up by primary key, not by octet/name/code
                     # string - unambiguous by construction, unlike

@@ -165,6 +165,8 @@ ACTIONS = {
     # every other writer on a network-shared sad.db, just with no
     # site-scoped kwargs to pass.
     "match_tunnels": db.match_tunnels,
+    "record_config_snapshot": db.record_config_snapshot,
+    "record_config_pull_result": db.record_config_pull_result,
 }
 
 

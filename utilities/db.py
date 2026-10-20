@@ -38,6 +38,8 @@ Design notes (decided during planning, not obvious from the code alone):
 
 import sqlite3
 import ipaddress
+import hashlib
+import zlib
 import mac_parser
 from contextlib import contextmanager
 from datetime import datetime, timezone
@@ -306,6 +308,42 @@ CREATE TABLE IF NOT EXISTS device_aliases (
     UNIQUE(site_id, hostname)
 );
 
+-- Running-config history. One row per DISTINCT config seen on a device
+-- (a pull identical to the newest stored snapshot adds nothing). The
+-- config text is zlib-compressed after the volatile header/timestamp
+-- lines are stripped (see config_parser.py), so content_hash only moves
+-- when the real config does. changed_at/changed_by/nvram_updated are the
+-- device's own "last configuration change" metadata parsed out of the
+-- header, stored for display only. is_baseline marks the very first
+-- snapshot ever stored for a device; pruning never deletes it.
+CREATE TABLE IF NOT EXISTS config_snapshots (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    device_id     INTEGER NOT NULL REFERENCES devices(id),
+    collected_at  TEXT NOT NULL,
+    content_hash  TEXT NOT NULL,
+    config_z      BLOB NOT NULL,
+    size_bytes    INTEGER,
+    line_count    INTEGER,
+    changed_at    TEXT,
+    changed_by    TEXT,
+    nvram_updated TEXT,
+    is_baseline   INTEGER NOT NULL DEFAULT 0
+);
+
+-- One row per device: when a config pull was last tried / last worked,
+-- the last error, and what the device itself last reported as its
+-- latest change (even when the config text was unchanged).
+CREATE TABLE IF NOT EXISTS config_pull_status (
+    device_id            INTEGER PRIMARY KEY REFERENCES devices(id),
+    last_attempt_at      TEXT,
+    last_success_at      TEXT,
+    last_error           TEXT,
+    device_changed_at    TEXT,
+    device_changed_by    TEXT,
+    device_nvram_updated TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_config_snapshots_device ON config_snapshots(device_id, id);
 CREATE INDEX IF NOT EXISTS idx_devices_site   ON devices(site_id);
 CREATE INDEX IF NOT EXISTS idx_devices_serial ON devices(serial_number);
 CREATE INDEX IF NOT EXISTS idx_links_site     ON links(site_id);
@@ -1691,7 +1729,138 @@ def delete_device(conn, device_id: int) -> None:
     foreign keys are enforced, so this raises if child rows remain.
     """
     conn.execute("DELETE FROM device_aliases WHERE device_id = ?", (device_id,))
+    # Config history belongs to the device row; a merged-away duplicate's
+    # snapshots are dropped with it (the survivor pulls its own).
+    conn.execute("DELETE FROM config_snapshots WHERE device_id = ?", (device_id,))
+    conn.execute("DELETE FROM config_pull_status WHERE device_id = ?", (device_id,))
     conn.execute("DELETE FROM devices WHERE id = ?", (device_id,))
+
+
+# ---------------------------------------------------------------------
+# Running-config snapshots
+# ---------------------------------------------------------------------
+
+# Newest snapshots kept per device (the baseline is kept on top of this).
+CONFIG_SNAPSHOTS_KEEP = 30
+# Mirrors dashboard_generate's STALE_THRESHOLD_DAYS (kept here so the
+# collector does not have to import the dashboard generator).
+CONFIG_SKIP_STALE_DAYS = 60
+
+
+def hash_config_text(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def _config_device_is_aged(device, site_last_cdp) -> bool:
+    """True if the device was last seen CONFIG_SKIP_STALE_DAYS or more
+    before the site's last CDP discovery, or was marked stale by hand."""
+    if device["marked_stale_at"]:
+        return True
+    if not device["last_seen"] or not site_last_cdp:
+        return False
+    try:
+        seen = datetime.fromisoformat(device["last_seen"])
+        scan = datetime.fromisoformat(site_last_cdp)
+    except ValueError:
+        return False
+    return (scan - seen).days >= CONFIG_SKIP_STALE_DAYS
+
+
+def get_config_targets(conn, site_id: int, include_stale: bool = False) -> list:
+    """Live devices at a site to pull a config from, as plain dicts:
+    id, hostname, platform, ips (ranked, best first) and latest_hash
+    (hash of the newest stored snapshot, or None). Aged/manually-stale
+    devices are skipped unless include_stale."""
+    site = get_site_by_id(conn, site_id)
+    site_last_cdp = site["last_cdp_discovery"] if site else None
+    targets = []
+    for d in get_devices_for_site(conn, site_id):
+        if not include_stale and _config_device_is_aged(d, site_last_cdp):
+            continue
+        row = conn.execute(
+            "SELECT content_hash FROM config_snapshots WHERE device_id = ? ORDER BY id DESC LIMIT 1", (d["id"],)
+        ).fetchone()
+        targets.append({
+            "id": d["id"], "hostname": d["hostname"], "platform": d["platform"],
+            "ips": get_ips_for_device(conn, d["id"]),
+            "latest_hash": row["content_hash"] if row else None,
+        })
+    return targets
+
+
+def record_config_pull_result(conn, device_id: int, ok: bool, error: str = None,
+                              changed_at: str = None, changed_by: str = None, nvram_updated: str = None) -> None:
+    """Note the outcome of one config pull. On success the device's own
+    reported last-change metadata is refreshed and any old error cleared;
+    on failure only the attempt time and error change."""
+    if conn.execute("SELECT 1 FROM devices WHERE id = ?", (device_id,)).fetchone() is None:
+        return  # device was purged since this was queued
+    now = _now()
+    conn.execute("INSERT INTO config_pull_status (device_id) VALUES (?) ON CONFLICT(device_id) DO NOTHING", (device_id,))
+    if ok:
+        conn.execute(
+            """UPDATE config_pull_status SET last_attempt_at = ?, last_success_at = ?, last_error = NULL,
+                   device_changed_at = ?, device_changed_by = ?, device_nvram_updated = ?
+               WHERE device_id = ?""",
+            (now, now, changed_at, changed_by, nvram_updated, device_id),
+        )
+    else:
+        conn.execute(
+            "UPDATE config_pull_status SET last_attempt_at = ?, last_error = ? WHERE device_id = ?",
+            (now, (error or "unknown error")[:500], device_id),
+        )
+
+
+def record_config_snapshot(conn, device_id: int, config_text: str, changed_at: str = None,
+                           changed_by: str = None, nvram_updated: str = None,
+                           keep: int = CONFIG_SNAPSHOTS_KEEP) -> dict:
+    """Store a cleaned running-config as a new snapshot unless it is
+    identical to the device's newest one. The first snapshot ever stored
+    for a device is flagged is_baseline and never pruned; beyond that
+    only the newest `keep` snapshots are retained. Also records a
+    successful pull. Returns {"stored", "snapshot_id", "pruned"}."""
+    if conn.execute("SELECT 1 FROM devices WHERE id = ?", (device_id,)).fetchone() is None:
+        return {"stored": False, "snapshot_id": None, "pruned": 0}
+    content_hash = hash_config_text(config_text)
+    latest = conn.execute(
+        "SELECT id, content_hash FROM config_snapshots WHERE device_id = ? ORDER BY id DESC LIMIT 1", (device_id,)
+    ).fetchone()
+    record_config_pull_result(conn, device_id, True, changed_at=changed_at, changed_by=changed_by,
+                              nvram_updated=nvram_updated)
+    if latest is not None and latest["content_hash"] == content_hash:
+        return {"stored": False, "snapshot_id": latest["id"], "pruned": 0}
+
+    raw = config_text.encode("utf-8")
+    cur = conn.execute(
+        """INSERT INTO config_snapshots
+               (device_id, collected_at, content_hash, config_z, size_bytes, line_count,
+                changed_at, changed_by, nvram_updated, is_baseline)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (device_id, _now(), content_hash, zlib.compress(raw, 9), len(raw), config_text.count("\n"),
+         changed_at, changed_by, nvram_updated, 1 if latest is None else 0),
+    )
+    pruned = conn.execute(
+        """DELETE FROM config_snapshots
+           WHERE device_id = ? AND is_baseline = 0
+             AND id NOT IN (SELECT id FROM config_snapshots WHERE device_id = ? ORDER BY id DESC LIMIT ?)""",
+        (device_id, device_id, keep),
+    ).rowcount
+    return {"stored": True, "snapshot_id": cur.lastrowid, "pruned": pruned}
+
+
+def get_config_snapshots(conn, device_id: int):
+    """Snapshot metadata (no config text), newest first."""
+    return conn.execute(
+        """SELECT id, collected_at, content_hash, size_bytes, line_count, changed_at, changed_by,
+                  nvram_updated, is_baseline
+           FROM config_snapshots WHERE device_id = ? ORDER BY id DESC""",
+        (device_id,),
+    ).fetchall()
+
+
+def get_config_snapshot_text(conn, snapshot_id: int):
+    row = conn.execute("SELECT config_z FROM config_snapshots WHERE id = ?", (snapshot_id,)).fetchone()
+    return zlib.decompress(row["config_z"]).decode("utf-8") if row else None
 
 
 # ---------------------------------------------------------------------
