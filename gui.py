@@ -365,6 +365,12 @@ def format_move_summary(summary: dict) -> list:
             lines.append(f"The IP it had before ({summary['previous_ip']}) is kept as a fallback.")
     else:
         lines.append(f"Management IP: unchanged ({summary['primary_ip'] or 'none'}).")
+    if summary.get("deleted_renamed"):
+        lines.append("")
+        lines.append(
+            "A deleted device with the same name at the destination is renamed out of the way "
+            f"(kept, not purged): {', '.join(summary['deleted_renamed'])}."
+        )
     if summary["seeds_cleared"]:
         lines.append("")
         lines.append(

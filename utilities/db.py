@@ -1979,10 +1979,12 @@ def move_device_to_site(conn, device_id: int, dest_site_id: int, new_mgmt_ip: st
     they all reference the device by id, so they stay valid. A later
     scan re-attributes anything that needs it.
 
-    Refuses (ValueError) when the destination already has a device with
-    this name, compared case-insensitively and including soft-deleted
-    rows, or a merge alias of that name: that is a duplicate to combine,
-    not a device to move.
+    Refuses (ValueError) when the destination already has a LIVE device
+    with this name (compared case-insensitively) or a merge alias of
+    that name pointing at a live device: that is a duplicate to combine,
+    not a device to move. A SOFT-DELETED device holding the name is not
+    a blocker - it is renamed to "<name> (deleted #<id>)" so the name is
+    free; the row and everything attached to it are kept.
 
     dry_run=True does all the work and then ROLLS BACK, exactly like
     merge_devices(), so a preview can't disagree with the real move.
@@ -2010,24 +2012,24 @@ def move_device_to_site(conn, device_id: int, dest_site_id: int, new_mgmt_ip: st
         except ValueError:
             raise ValueError(f"'{new_mgmt_ip.strip()}' is not a valid IP address.") from None
 
-    clash = conn.execute(
-        "SELECT hostname, deleted_at FROM devices WHERE site_id = ? AND lower(hostname) = lower(?)",
+    # A LIVE device with this name at the destination means a real duplicate: refuse. A SOFT-DELETED one
+    # (e.g. someone re-added the device by hand there, then deleted that copy) is just squatting on the
+    # name - it is renamed out of the way below, not destroyed, so nothing attached to it is lost.
+    deleted_clashes = []
+    for clash in conn.execute(
+        "SELECT id, hostname, deleted_at FROM devices WHERE site_id = ? AND lower(hostname) = lower(?)",
         (dest_site["id"], hostname),
-    ).fetchone()
-    if clash is not None:
-        if clash["deleted_at"]:
+    ).fetchall():
+        if not clash["deleted_at"]:
             raise ValueError(
-                f"Site {dest_label} has a deleted device named '{clash['hostname']}', which still holds that name. "
-                f"Restore or purge it first."
+                f"Site {dest_label} already has a device named '{clash['hostname']}'. That looks like the same "
+                f"device, so the move was stopped instead of creating a duplicate."
             )
-        raise ValueError(
-            f"Site {dest_label} already has a device named '{clash['hostname']}'. That looks like the same "
-            f"device, so the move was stopped instead of creating a duplicate."
-        )
+        deleted_clashes.append(clash)
     alias_clash = conn.execute(
         """
         SELECT d.hostname FROM device_aliases a JOIN devices d ON d.id = a.device_id
-        WHERE a.site_id = ? AND a.hostname = ?
+        WHERE a.site_id = ? AND a.hostname = ? AND d.deleted_at IS NULL
         """,
         (dest_site["id"], hostname),
     ).fetchone()
@@ -2046,12 +2048,23 @@ def move_device_to_site(conn, device_id: int, dest_site_id: int, new_mgmt_ip: st
         "primary_ip": None,
         "ip_is_primary": None,
         "seeds_cleared": [],
+        "deleted_renamed": [],
         "aliases_moved": 0,
         "links_left": 0,
         "clients_left": 0,
         "arp_left": 0,
         "dry_run": bool(dry_run),
     }
+
+    # --- free the name: rename any soft-deleted device holding it at the destination ---
+    for clash in deleted_clashes:
+        new_name = f"{clash['hostname']} (deleted #{clash['id']})"
+        conn.execute("UPDATE devices SET hostname = ? WHERE id = ?", (new_name, clash["id"]))
+        conn.execute(
+            "DELETE FROM device_aliases WHERE site_id = ? AND hostname = ? AND device_id = ?",
+            (dest_site["id"], hostname, clash["id"]),
+        )
+        summary["deleted_renamed"].append(new_name)
 
     # --- seed flags at the old site ---
     if dev["is_seed"]:
