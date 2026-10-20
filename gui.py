@@ -1575,6 +1575,14 @@ class DiscoveryTab(ttk.Frame):
         )
         self.collect_tunnels_check.grid(row=3, column=1, columnspan=4, sticky="w", pady=(4, 0))
 
+        # Config collection skips stale devices (manually marked, or aged
+        # out) by default, since they are the likeliest to time out.
+        self.config_stale_var = tk.BooleanVar(value=False)
+        self.config_stale_check = ttk.Checkbutton(
+            controls, text="Include stale devices (config collection only)", variable=self.config_stale_var,
+        )
+        self.config_stale_check.grid(row=4, column=1, columnspan=4, sticky="w", pady=(4, 0))
+
         self.run_button = ttk.Button(controls, text="Run", command=self._on_run_clicked)
         self.run_button.grid(row=0, column=6, rowspan=2, sticky="ns", padx=(20, 0))
 
@@ -1642,6 +1650,7 @@ class DiscoveryTab(ttk.Frame):
         # dashboard" (no network connection at all) disables it.
         collect_tunnels_relevant = self.action_var.get() in ("cdp", "arp", "all")  # not "configs"
         self.collect_tunnels_check.configure(state="normal" if collect_tunnels_relevant else "disabled")
+        self.config_stale_check.configure(state="normal" if self.action_var.get() == "configs" else "disabled")
 
     def _refresh_site_choices(self):
         with db.get_conn() as conn:
@@ -1851,7 +1860,10 @@ class DiscoveryTab(ttk.Frame):
             actions = ["cdp", "arp"] if action == "all" else [action]
             collect_mac_tables = self.collect_mac_var.get() and action in ("cdp", "all")
             collect_tunnels_flag = self.collect_tunnels_var.get() and action in ("cdp", "arp", "all")
-            worker_target, worker_args = self._run_worker, (site_id, actions, creds, collect_mac_tables, collect_tunnels_flag)
+            config_include_stale = self.config_stale_var.get() and action == "configs"
+            worker_target, worker_args = self._run_worker, (
+                site_id, actions, creds, collect_mac_tables, collect_tunnels_flag, config_include_stale,
+            )
 
         self._worker_thread = threading.Thread(target=worker_target, args=worker_args, daemon=True)
         self._worker_thread.start()
@@ -1899,7 +1911,8 @@ class DiscoveryTab(ttk.Frame):
             sys.stdout = original_stdout
             self._output_queue.put(_DONE)
 
-    def _run_worker(self, site_id, actions, creds, collect_mac_tables=False, collect_tunnels_flag=False):
+    def _run_worker(self, site_id, actions, creds, collect_mac_tables=False, collect_tunnels_flag=False,
+                    config_include_stale=False):
         original_stdout = sys.stdout
         sys.stdout = _QueueWriter(self._output_queue)
         try:
@@ -1944,6 +1957,7 @@ class DiscoveryTab(ttk.Frame):
                 orchestrator.run_for_sites(
                     sites, actions, creds, collect_mac_tables=collect_mac_tables,
                     collect_tunnels_flag=collect_tunnels_flag,
+                    config_include_stale=config_include_stale,
                     progress_cb=self._on_discovery_progress,
                 )
         except Exception as e:

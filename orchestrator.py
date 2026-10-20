@@ -1,6 +1,6 @@
 """
 orchestrator.py - Top-level entry point for Site Awareness Dashboard
-data collection. Actions available per site:
+data collection. Two actions are available per site:
 
     cdp - walk CDP outward from the site's seed device, writing
           discovered devices/links into the DB as source='cdp'
@@ -1136,10 +1136,16 @@ def collect_configs(site_row, creds: dict, open_session_fn=None, session_log_dir
     username, password = _get_tacacs_credentials(creds)
     octet = site_row["site_octet"]
 
+    skipped = []
     with db.get_conn() as conn:
-        targets = db.get_config_targets(conn, site_row["id"], include_stale=include_stale)
+        targets = db.get_config_targets(conn, site_row["id"], include_stale=include_stale, skipped=skipped)
     if only_device_ids is not None:
         targets = [t for t in targets if t["id"] in only_device_ids]
+    if skipped:
+        print(f"  Site {octet}: skipped {len(skipped)} stale device(s): "
+              + "; ".join(f"{h} ({r})" for h, r in skipped)
+              + ". Tick 'Include stale devices' (GUI) or use --include-stale to pull them anyway.")
+        _report_progress(progress_cb, "status", octet, slot, "configs", f"Skipping {len(skipped)} stale device(s)")
     if not targets:
         print(f"  Site {octet}: no devices to pull configs from.")
         _report_progress(progress_cb, "status", octet, slot, "skipped", "Skipped - no devices to pull configs from")
@@ -1180,10 +1186,11 @@ def collect_configs(site_row, creds: dict, open_session_fn=None, session_log_dir
                 print(f"    {host}: could not record the failure: {e2}", flush=True)
 
     print(f"  Site {octet}: configs - {stored} new snapshot(s), {unchanged} unchanged, {failed} failed "
-          f"of {len(targets)} device(s).")
+          f"of {len(targets)} device(s)" + (f" ({len(skipped)} stale skipped)." if skipped else "."))
     _report_progress(
         progress_cb, "status", octet, slot, "configs",
-        f"Configs complete: {stored} changed / {unchanged} unchanged / {failed} failed",
+        f"Configs complete: {stored} changed / {unchanged} unchanged / {failed} failed"
+        + (f" / {len(skipped)} stale skipped" if skipped else ""),
     )
 
 

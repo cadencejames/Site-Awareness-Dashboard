@@ -1751,31 +1751,38 @@ def hash_config_text(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
-def _config_device_is_aged(device, site_last_cdp) -> bool:
-    """True if the device was last seen CONFIG_SKIP_STALE_DAYS or more
-    before the site's last CDP discovery, or was marked stale by hand."""
+def _config_stale_reason(device, site_last_cdp):
+    """Why a config pull would skip this device as stale, or None. Stale =
+    marked stale by hand (note: being reached by CDP does NOT clear that
+    mark), or last seen CONFIG_SKIP_STALE_DAYS or more before the site's
+    last CDP discovery."""
     if device["marked_stale_at"]:
-        return True
+        return "manually marked stale"
     if not device["last_seen"] or not site_last_cdp:
-        return False
+        return None
     try:
         seen = datetime.fromisoformat(device["last_seen"])
         scan = datetime.fromisoformat(site_last_cdp)
-    except ValueError:
-        return False
-    return (scan - seen).days >= CONFIG_SKIP_STALE_DAYS
+        days = (scan - seen).days
+    except (ValueError, TypeError):
+        return None
+    return f"last seen {days} days before the site's last CDP scan" if days >= CONFIG_SKIP_STALE_DAYS else None
 
 
-def get_config_targets(conn, site_id: int, include_stale: bool = False) -> list:
+def get_config_targets(conn, site_id: int, include_stale: bool = False, skipped: list = None) -> list:
     """Live devices at a site to pull a config from, as plain dicts:
     id, hostname, platform, ips (ranked, best first) and latest_hash
     (hash of the newest stored snapshot, or None). Aged/manually-stale
-    devices are skipped unless include_stale."""
+    devices are skipped unless include_stale; if a list is passed as
+    `skipped`, a (hostname, reason) pair is appended for each one."""
     site = get_site_by_id(conn, site_id)
     site_last_cdp = site["last_cdp_discovery"] if site else None
     targets = []
     for d in get_devices_for_site(conn, site_id):
-        if not include_stale and _config_device_is_aged(d, site_last_cdp):
+        reason = _config_stale_reason(d, site_last_cdp)
+        if reason and not include_stale:
+            if skipped is not None:
+                skipped.append((d["hostname"], reason))
             continue
         row = conn.execute(
             "SELECT content_hash FROM config_snapshots WHERE device_id = ? ORDER BY id DESC LIMIT 1", (d["id"],)
