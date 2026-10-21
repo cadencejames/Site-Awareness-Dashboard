@@ -29,7 +29,21 @@ h1{ font-size:22px; margin:0 0 4px; }
 body.mode-tree .panes{ grid-template-columns:1fr; } body.mode-tree #pane-R{ display:none; }
 .pane{ background:var(--panel); border:1px solid var(--border); border-radius:var(--radius); padding:12px 14px; min-width:0; }
 .pane-title{ font-family:var(--mono); font-size:11px; letter-spacing:.06em; text-transform:uppercase; color:var(--text-dim); margin-bottom:8px; }
-.pane-row{ display:flex; gap:8px; } .pane-row input{ flex:1 1 50%; min-width:0; } .pane-row select{ flex:1 1 50%; min-width:0; }
+.field{ margin-bottom:8px; } .field > label{ display:block; font-family:var(--mono); font-size:11px; color:var(--text-dim); margin-bottom:4px; }
+.field select{ width:100%; box-sizing:border-box; }
+.picker{ position:relative; }
+.pick-btn{ width:100%; box-sizing:border-box; display:flex; align-items:center; gap:10px; text-align:left; background:var(--panel-2); border:1px solid var(--border); border-radius:8px; padding:9px 12px; cursor:pointer; font-size:14px; }
+.pick-btn:hover{ border-color:var(--accent); }
+.pick-btn .pn{ font-weight:600; font-family:var(--mono); } .pick-btn .ps{ color:var(--text-dim); font-size:12px; } .pick-btn .caret{ margin-left:auto; color:var(--accent); }
+.pick-panel{ position:absolute; z-index:20; left:0; right:0; top:calc(100% + 4px); background:var(--panel); border:1px solid var(--accent); border-radius:10px; box-shadow:0 10px 30px rgba(0,0,0,.35); padding:8px; }
+.pick-search{ width:100%; box-sizing:border-box; margin-bottom:6px; }
+.pick-list{ position:relative; max-height:360px; overflow-y:auto; }
+.pick-row{ display:flex; gap:12px; align-items:baseline; padding:7px 10px; border-radius:6px; cursor:pointer; }
+.pick-row .pn{ flex:1 1 40%; min-width:0; font-family:var(--mono); font-size:13px; font-weight:600; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.pick-row .ps{ flex:1 1 35%; min-width:0; color:var(--text-dim); font-size:12px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.pick-row .pc{ font-family:var(--mono); font-size:11px; color:var(--text-dim); white-space:nowrap; }
+.pick-row.active, .pick-row:hover{ background:var(--panel-2); } .pick-row.cur .pn{ color:var(--accent); }
+.pick-none{ padding:12px; text-align:center; color:var(--text-dim); }
 .meta{ font-family:var(--mono); font-size:11px; color:var(--text-dim); margin-top:8px; line-height:1.5; }
 .warn{ font-family:var(--mono); font-size:11px; color:var(--warn); margin-top:6px; }
 [hidden]{ display:none !important; }
@@ -79,16 +93,21 @@ tr.flash td{ outline:2px solid var(--accent); outline-offset:-2px; }
   <div class="panes">
     <section class="pane" id="pane-L">
       <div class="pane-title" id="L-title">Older</div>
-      <div class="pane-row"><input type="text" id="L-dev" list="devlist" placeholder="Type a device name..." autocomplete="off"><select id="L-snap"></select></div>
+      <div class="field"><label>Device (click to search)</label>
+        <div class="picker" id="L-picker"><button type="button" class="pick-btn"></button>
+          <div class="pick-panel" hidden><input type="search" class="pick-search" autocomplete="off"><div class="pick-list"></div></div></div></div>
+      <div class="field"><label>Snapshot</label><select id="L-snap"></select></div>
       <div class="meta" id="L-meta"></div><div class="warn" id="L-warn"></div>
     </section>
     <section class="pane" id="pane-R">
       <div class="pane-title">Newer</div>
-      <div class="pane-row"><input type="text" id="R-dev" list="devlist" placeholder="Type a device name..." autocomplete="off"><select id="R-snap"></select></div>
+      <div class="field"><label>Device (click to search)</label>
+        <div class="picker" id="R-picker"><button type="button" class="pick-btn"></button>
+          <div class="pick-panel" hidden><input type="search" class="pick-search" autocomplete="off"><div class="pick-list"></div></div></div></div>
+      <div class="field"><label>Snapshot</label><select id="R-snap"></select></div>
       <div class="meta" id="R-meta"></div><div class="warn" id="R-warn"></div>
     </section>
   </div>
-  <datalist id="devlist"></datalist>
 
   <div class="toolbar" id="tb-compare">
     <button id="b-prev" title="Compare the newer side with the snapshot before it (same device)">Compare to previous</button>
@@ -142,17 +161,59 @@ function fmtSize(n){ return n >= 1048576 ? (n/1048576).toFixed(1) + " MB" : Math
 
 $("gen").textContent = window.CFG_GENERATED ? ("Generated " + window.CFG_GENERATED + " · " + IDX.length + " device(s)") : "";
 
-/* ---------- device list ---------- */
-var labelToId = {}, idToLabel = {};
-(function(){
-  var dl = $("devlist");
-  IDX.forEach(function(d){
-    var lab = d.h + "  [" + (d.sn || d.s) + "]";
-    if(Object.prototype.hasOwnProperty.call(labelToId, lab)) lab += " #" + d.id;
-    labelToId[lab] = d.id; idToLabel[d.id] = lab;
-    var o = document.createElement("option"); o.value = lab; dl.appendChild(o);
+/* ---------- searchable device picker ---------- */
+function Picker(root, onPick){
+  var btn = root.querySelector(".pick-btn"), panel = root.querySelector(".pick-panel"),
+      search = root.querySelector(".pick-search"), list = root.querySelector(".pick-list");
+  var cur = null, shown = [], active = -1;
+  search.placeholder = "Search " + IDX.length + " devices by name or site...";
+  function paintActive(){
+    var rows = list.children;
+    for(var i = 0; i < rows.length; i++) rows[i].classList.toggle("active", i === active);
+    var r = rows[active];
+    if(r){
+      if(r.offsetTop < list.scrollTop) list.scrollTop = r.offsetTop;
+      else if(r.offsetTop + r.offsetHeight > list.scrollTop + list.clientHeight) list.scrollTop = r.offsetTop + r.offsetHeight - list.clientHeight;
+    }
+  }
+  function close(){ panel.hidden = true; }
+  function choose(id){ close(); onPick(id); }
+  function fill(){
+    var q = search.value.trim().toLowerCase();
+    clear(list); shown = [];
+    IDX.forEach(function(d){ if(!q || (d.h + " " + (d.sn || "") + " " + d.s).toLowerCase().indexOf(q) >= 0) shown.push(d); });
+    shown.forEach(function(d){
+      var row = el("div", "pick-row" + (d.id === cur ? " cur" : ""));
+      row.appendChild(el("span", "pn", d.h));
+      row.appendChild(el("span", "ps", d.sn || ("site " + d.s)));
+      row.appendChild(el("span", "pc", (d.n ? d.n + (d.n === 1 ? " snapshot" : " snapshots") : "no config yet") + (d.er ? " \u26a0" : "")));
+      row.addEventListener("mousedown", function(e){ e.preventDefault(); choose(d.id); });
+      list.appendChild(row);
+    });
+    if(!shown.length) list.appendChild(el("div", "pick-none", "No device matches '" + search.value.trim() + "'"));
+    active = shown.length ? 0 : -1; list.scrollTop = 0; paintActive();
+  }
+  function setCurrent(id){
+    cur = id; var d = byId[id]; clear(btn);
+    btn.appendChild(el("span", "pn", d ? d.h : "(choose a device)"));
+    if(d) btn.appendChild(el("span", "ps", d.sn || ("site " + d.s)));
+    btn.appendChild(el("span", "caret", "\u25be"));
+  }
+  btn.addEventListener("click", function(){
+    if(!panel.hidden){ close(); return; }
+    panel.hidden = false; search.value = ""; fill(); search.focus();
   });
-})();
+  search.addEventListener("input", fill);
+  search.addEventListener("keydown", function(e){
+    if(e.key === "ArrowDown"){ e.preventDefault(); if(active < shown.length - 1){ active++; paintActive(); } }
+    else if(e.key === "ArrowUp"){ e.preventDefault(); if(active > 0){ active--; paintActive(); } }
+    else if(e.key === "Enter"){ e.preventDefault(); if(active >= 0) choose(shown[active].id); }
+    else if(e.key === "Escape"){ close(); btn.focus(); }
+  });
+  document.addEventListener("mousedown", function(e){ if(!root.contains(e.target)) close(); });
+  setCurrent(null);
+  return { setCurrent: setCurrent, close: close };
+}
 
 /* ---------- data loading (script tags, so it works from file://) ---------- */
 var cache = {};
@@ -175,12 +236,14 @@ function loadDevice(id){
 
 /* ---------- panes ---------- */
 function Pane(p){
-  this.p = p; this.dev = $(p + "-dev"); this.sel = $(p + "-snap"); this.meta = $(p + "-meta"); this.warn = $(p + "-warn");
-  this.id = null; this.snaps = []; this.idx = 0;
+  var self = this;
+  this.p = p; this.sel = $(p + "-snap"); this.meta = $(p + "-meta"); this.warn = $(p + "-warn");
+  this.id = null; this.snaps = []; this.idx = 0; this.onPick = function(){};
+  this.picker = new Picker($(p + "-picker"), function(id){ self.onPick(id); });
 }
 Pane.prototype.snap = function(){ return this.snaps.length ? this.snaps[this.idx] : null; };
 Pane.prototype.setDevice = function(id, idx){
-  var self = this; self.id = id; self.dev.value = idToLabel[id] || "";
+  var self = this; self.id = id; self.picker.setCurrent(id);
   clear(self.sel); self.meta.textContent = "Loading..."; self.warn.textContent = "";
   return loadDevice(id).then(function(arr){
     self.snaps = arr; self.idx = Math.max(0, Math.min(idx || 0, arr.length - 1));
@@ -453,30 +516,9 @@ function updateUrl(){
     history.replaceState(null, "", "?" + p.toString());
   } catch(e) {}
 }
-function findDevice(text){
-  var t = text.trim().toLowerCase();
-  if(!t) return { n: 0 };
-  if(Object.prototype.hasOwnProperty.call(labelToId, text)) return { id: labelToId[text], n: 1 };
-  var exact = IDX.filter(function(d){ return d.h.toLowerCase() === t; });
-  if(exact.length === 1) return { id: exact[0].id, n: 1 };
-  var part = IDX.filter(function(d){ return (d.h + " " + (d.sn || d.s)).toLowerCase().indexOf(t) >= 0; });
-  if(part.length === 1) return { id: part[0].id, n: 1 };
-  return { n: part.length };
-}
-function paneDeviceChanged(pane, otherDefaultIdx){
-  var found = findDevice(pane.dev.value);
-  if(found.id === undefined){
-    var typed = pane.dev.value.trim();
-    pane.dev.value = pane.id != null ? (idToLabel[pane.id] || "") : "";
-    pane.warn.textContent = !typed ? "" : found.n > 1 ? found.n + " devices match '" + typed + "'. Pick one from the list." : "No device matches '" + typed + "'.";
-    return;
-  }
-  pane.setDevice(found.id, otherDefaultIdx || 0).then(rerender);
-}
-left.dev.addEventListener("change", function(){ paneDeviceChanged(left, 0); });
-right.dev.addEventListener("change", function(){ paneDeviceChanged(right, 0); });
+left.onPick = function(id){ left.setDevice(id, 0).then(rerender); };
+right.onPick = function(id){ right.setDevice(id, 0).then(rerender); };
 [left, right].forEach(function(p){
-  p.dev.addEventListener("focus", function(){ p.dev.select(); });
   p.sel.addEventListener("change", function(){ p.idx = parseInt(p.sel.value, 10) || 0; p.paint(); rerender(); });
 });
 $("b-prev").addEventListener("click", function(){
