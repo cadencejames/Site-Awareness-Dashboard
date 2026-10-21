@@ -47,6 +47,7 @@ import credential_store  # noqa: E402
 import credential_loader  # noqa: E402
 import orchestrator  # noqa: E402
 import dashboard_generate  # noqa: E402
+import config_viewer  # noqa: E402
 import csv_export  # noqa: E402
 import write_queue  # noqa: E402
 
@@ -1876,6 +1877,10 @@ class DiscoveryTab(ttk.Frame):
             db.log_activity("generate_dashboard", f"Generate dashboard - {scope_label}")
             if site_id is None:
                 dashboard_generate.generate_all()
+                with db.get_conn() as conn:
+                    cfg = config_viewer.generate_config_pages(conn)
+                print(f"  Wrote config viewer: {cfg['devices']} device(s), {cfg['written']} rebuilt, "
+                      f"{cfg['skipped']} unchanged")
             else:
                 with db.get_conn() as conn:
                     # Looked up by primary key, same reasoning as
@@ -1905,6 +1910,11 @@ class DiscoveryTab(ttk.Frame):
                         # "all sites" run.
                         site_map_path = dashboard_generate.generate_site_map(conn)
                         print(f"  Wrote {site_map_path}")
+                        # Config viewer: this site's device data files
+                        # are rebuilt (others untouched); the viewer's
+                        # device index is always refreshed.
+                        cfg = config_viewer.generate_config_pages(conn, site_id=site["id"])
+                        print(f"  Wrote config viewer: {cfg['written']} device file(s) rebuilt for this site")
         except Exception as e:
             print(f"ERROR: {e}")
         finally:

@@ -1,0 +1,533 @@
+<!DOCTYPE html>
+<html data-theme="light">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Device Configs &mdash; Site Awareness Dashboard</title>
+<style>
+__CSS_TOKENS__
+:root{ --add-bg: rgba(31,157,92,.16); --del-bg: rgba(192,57,43,.14); --add-hl: rgba(31,157,92,.38); --del-hl: rgba(192,57,43,.34); --chg: #e8a33d; }
+html[data-theme="dark"]{ --add-bg: rgba(61,220,132,.14); --del-bg: rgba(232,93,93,.16); --add-hl: rgba(61,220,132,.34); --del-hl: rgba(232,93,93,.36); }
+body{ margin:0; background:var(--bg); color:var(--text); font-family:var(--sans); }
+.wrap{ max-width:1500px; margin:0 auto; padding:24px; }
+a{ color:inherit; }
+button, select, input{ font-family:var(--sans); font-size:13px; color:var(--text); }
+button{ background:var(--panel-2); border:1px solid var(--border); border-radius:8px; padding:7px 12px; cursor:pointer; }
+button:hover{ border-color:var(--accent); }
+button.on{ border-color:var(--accent); color:var(--accent); }
+select, input[type=text], input[type=search]{ background:var(--panel); border:1px solid var(--border); border-radius:8px; padding:7px 10px; }
+select:focus, input:focus{ outline:none; border-color:var(--accent); }
+.icon-btn{ width:38px; height:38px; padding:0; display:flex; align-items:center; justify-content:center; font-size:16px; }
+header{ display:flex; justify-content:space-between; align-items:flex-start; padding-bottom:16px; border-bottom:1px solid var(--border); margin-bottom:18px; }
+h1{ font-size:22px; margin:0 0 4px; }
+.subtitle{ font-family:var(--mono); font-size:12px; color:var(--text-dim); }
+.header-actions{ display:flex; gap:8px; align-items:center; }
+.backlink{ display:inline-block; font-family:var(--mono); font-size:12px; color:var(--text-dim); border:1px solid var(--border); border-radius:999px; padding:5px 12px; text-decoration:none; margin-bottom:14px; }
+.backlink:hover{ color:var(--accent); border-color:var(--accent); }
+.seg{ display:flex; gap:0; } .seg button:first-child{ border-radius:8px 0 0 8px; } .seg button:last-child{ border-radius:0 8px 8px 0; border-left:none; }
+.panes{ display:grid; grid-template-columns:1fr 1fr; gap:14px; margin-bottom:12px; }
+body.mode-tree .panes{ grid-template-columns:1fr; } body.mode-tree #pane-R{ display:none; }
+.pane{ background:var(--panel); border:1px solid var(--border); border-radius:var(--radius); padding:12px 14px; min-width:0; }
+.pane-title{ font-family:var(--mono); font-size:11px; letter-spacing:.06em; text-transform:uppercase; color:var(--text-dim); margin-bottom:8px; }
+.pane-row{ display:flex; gap:8px; } .pane-row input{ flex:1 1 50%; min-width:0; } .pane-row select{ flex:1 1 50%; min-width:0; }
+.meta{ font-family:var(--mono); font-size:11px; color:var(--text-dim); margin-top:8px; line-height:1.5; }
+.warn{ font-family:var(--mono); font-size:11px; color:var(--warn); margin-top:6px; }
+[hidden]{ display:none !important; }
+.toolbar{ display:flex; flex-wrap:wrap; gap:8px; align-items:center; margin:10px 0 12px; }
+.toolbar label{ font-size:12px; color:var(--text-dim); display:flex; align-items:center; gap:5px; }
+.stat{ font-family:var(--mono); font-size:12px; padding:4px 10px; border-radius:999px; border:1px solid var(--border); background:var(--panel); }
+.stat.add{ color:var(--up); } .stat.del{ color:var(--warn); }
+.spacer{ flex:1; }
+.empty{ padding:36px; text-align:center; color:var(--text-dim); border:1px dashed var(--border); border-radius:var(--radius); }
+.banner{ padding:8px 12px; border-radius:8px; border:1px solid var(--border); background:var(--panel); font-size:13px; margin-bottom:10px; }
+.banner.ok{ border-color:var(--up); color:var(--up); } .banner.bad{ border-color:var(--warn); color:var(--warn); }
+table.diff{ width:100%; border-collapse:collapse; table-layout:fixed; font-family:var(--mono); font-size:12px; background:var(--panel); border:1px solid var(--border); border-radius:var(--radius); }
+table.diff td{ padding:0 6px; vertical-align:top; line-height:1.55; }
+td.ln{ width:46px; text-align:right; color:var(--text-dim); user-select:none; border-right:1px solid var(--border); font-size:11px; }
+td.code{ white-space:pre-wrap; word-break:break-all; width:calc(50% - 46px); }
+td.code.left{ border-right:1px solid var(--border); }
+td.code.add{ background:var(--add-bg); } td.code.del{ background:var(--del-bg); } td.code.blank{ background:var(--panel-2); }
+td.code .hl.add{ background:var(--add-hl); } td.code .hl.del{ background:var(--del-hl); }
+tr.sec td{ background:var(--panel-2); color:var(--accent); font-size:11px; padding:3px 8px; border-top:1px solid var(--border); border-bottom:1px solid var(--border); white-space:pre-wrap; }
+tr.gap td{ text-align:center; color:var(--text-dim); background:var(--panel-2); cursor:pointer; padding:3px; font-size:11px; }
+tr.gap:hover td{ color:var(--accent); }
+tr.flash td{ outline:2px solid var(--accent); outline-offset:-2px; }
+.tree{ font-family:var(--mono); font-size:12px; background:var(--panel); border:1px solid var(--border); border-radius:var(--radius); padding:10px 14px; overflow-x:auto; }
+.tree details{ margin:0; } .tree summary{ cursor:pointer; padding:1px 0; list-style-position:inside; }
+.tree summary:hover, .tree .line:hover{ background:var(--panel-2); }
+.tree .kids{ margin-left:18px; border-left:1px solid var(--border); padding-left:10px; }
+.tree .line{ padding:1px 0 1px 14px; white-space:pre-wrap; word-break:break-all; }
+.tree .count{ color:var(--text-dim); font-size:11px; margin-left:8px; }
+.tree .chg > summary, .tree .line.chg{ border-left:3px solid var(--chg); padding-left:6px; }
+.tree .line.chg{ padding-left:11px; }
+.tree mark{ background:var(--add-hl); color:inherit; border-radius:2px; }
+.foot{ font-size:12px; color:var(--text-dim); margin-top:18px; line-height:1.6; }
+@media (max-width:900px){ .panes{ grid-template-columns:1fr; } }
+</style>
+</head>
+<body class="mode-compare">
+<div class="wrap">
+  <a class="backlink" href="index.html">&larr; Dashboard</a>
+  <header>
+    <div><h1>Device Configs</h1><div class="subtitle" id="gen"></div></div>
+    <div class="header-actions">
+      <div class="seg"><button id="m-compare" class="on">Compare</button><button id="m-tree">Tree</button></div>
+      <button id="theme-toggle" class="icon-btn" title="Toggle theme"></button>
+    </div>
+  </header>
+
+  <div class="panes">
+    <section class="pane" id="pane-L">
+      <div class="pane-title" id="L-title">Older</div>
+      <div class="pane-row"><input type="text" id="L-dev" list="devlist" placeholder="Type a device name..." autocomplete="off"><select id="L-snap"></select></div>
+      <div class="meta" id="L-meta"></div><div class="warn" id="L-warn"></div>
+    </section>
+    <section class="pane" id="pane-R">
+      <div class="pane-title">Newer</div>
+      <div class="pane-row"><input type="text" id="R-dev" list="devlist" placeholder="Type a device name..." autocomplete="off"><select id="R-snap"></select></div>
+      <div class="meta" id="R-meta"></div><div class="warn" id="R-warn"></div>
+    </section>
+  </div>
+  <datalist id="devlist"></datalist>
+
+  <div class="toolbar" id="tb-compare">
+    <button id="b-prev" title="Compare the newer side with the snapshot before it (same device)">Compare to previous</button>
+    <button id="b-swap" title="Swap the two sides">&#8644; Swap</button>
+    <label>Context <select id="ctx"><option value="3">3 lines</option><option value="10">10 lines</option><option value="25">25 lines</option><option value="all">Whole config</option></select></label>
+    <button id="b-pc" title="Previous change (p)">&#9650; Prev change</button>
+    <button id="b-nc" title="Next change (n)">&#9660; Next change</button>
+    <span class="spacer"></span><span id="stats"></span>
+  </div>
+  <div class="toolbar" id="tb-tree" hidden>
+    <input type="search" id="tsearch" placeholder="Search this config..." style="min-width:260px">
+    <button id="t-expand">Expand all</button><button id="t-collapse">Collapse all</button>
+    <label><input type="checkbox" id="t-mark" checked> Mark changes vs previous snapshot</label>
+    <label><input type="checkbox" id="t-only"> Only changed</label>
+    <span class="spacer"></span><span id="tstats"></span>
+  </div>
+
+  <div id="out"></div>
+  <p class="foot">Passwords, SNMP communities, keys and similar secrets are replaced with <code>&lt;redacted:xxxx&gt;</code> before this page is built. The four characters change when the secret changes, so a changed secret still shows up as a change without revealing it.
+  Device-reported &ldquo;changed by&rdquo; is only as good as the device: it is the last change only, IOS shows a user only for logged-in sessions, and NX-OS shows none.</p>
+</div>
+<script src="configs/index.js"></script>
+<script>
+(function(){
+"use strict";
+var IDX = (window.CFG_INDEX || []).slice();
+IDX.sort(function(a,b){ return a.h.toLowerCase() < b.h.toLowerCase() ? -1 : a.h.toLowerCase() > b.h.toLowerCase() ? 1 : 0; });
+var byId = {}; IDX.forEach(function(d){ byId[d.id] = d; });
+
+function $(id){ return document.getElementById(id); }
+function el(tag, cls, text){ var e = document.createElement(tag); if(cls) e.className = cls; if(text != null) e.textContent = text; return e; }
+function clear(n){ while(n.firstChild) n.removeChild(n.firstChild); }
+function fmtTs(iso){
+  if(!iso) return "never"; var d = new Date(iso); if(isNaN(d.getTime())) return iso;
+  return d.toLocaleString([], {year:"numeric", month:"short", day:"numeric", hour:"2-digit", minute:"2-digit"});
+}
+function fmtSize(n){ return n >= 1048576 ? (n/1048576).toFixed(1) + " MB" : Math.max(1, Math.round(n/1024)) + " KB"; }
+
+/* ---------- theme ---------- */
+(function(){
+  var root = document.documentElement, btn = $("theme-toggle");
+  function paint(t){ btn.textContent = t === "dark" ? "🌙" : "☀️"; }
+  var saved = null; try { saved = localStorage.getItem("sad-theme"); } catch(e) {}
+  if(saved) root.setAttribute("data-theme", saved);
+  paint(root.getAttribute("data-theme"));
+  btn.addEventListener("click", function(){
+    var next = root.getAttribute("data-theme") === "dark" ? "light" : "dark";
+    root.setAttribute("data-theme", next); try { localStorage.setItem("sad-theme", next); } catch(e) {} paint(next);
+  });
+})();
+
+$("gen").textContent = window.CFG_GENERATED ? ("Generated " + window.CFG_GENERATED + " · " + IDX.length + " device(s)") : "";
+
+/* ---------- device list ---------- */
+var labelToId = {}, idToLabel = {};
+(function(){
+  var dl = $("devlist");
+  IDX.forEach(function(d){
+    var lab = d.h + "  [" + (d.sn || d.s) + "]";
+    if(Object.prototype.hasOwnProperty.call(labelToId, lab)) lab += " #" + d.id;
+    labelToId[lab] = d.id; idToLabel[d.id] = lab;
+    var o = document.createElement("option"); o.value = lab; dl.appendChild(o);
+  });
+})();
+
+/* ---------- data loading (script tags, so it works from file://) ---------- */
+var cache = {};
+function loadDevice(id){
+  var d = byId[id];
+  if(!d || !d.n) return Promise.resolve([]);
+  if(cache[id]) return cache[id];
+  cache[id] = new Promise(function(resolve, reject){
+    var s = document.createElement("script"); s.src = "configs/dev_" + id + ".js";
+    s.onload = function(){
+      var arr = (window.CFG_DATA || {})[id] || [];
+      arr.forEach(function(sn){ var t = sn.t.replace(/\r/g, ""); sn.lines = t.length ? t.replace(/\n$/, "").split("\n") : []; });
+      resolve(arr);
+    };
+    s.onerror = function(){ delete cache[id]; reject(new Error("data file for this device is missing - regenerate the dashboard")); };
+    document.head.appendChild(s);
+  });
+  return cache[id];
+}
+
+/* ---------- panes ---------- */
+function Pane(p){
+  this.p = p; this.dev = $(p + "-dev"); this.sel = $(p + "-snap"); this.meta = $(p + "-meta"); this.warn = $(p + "-warn");
+  this.id = null; this.snaps = []; this.idx = 0;
+}
+Pane.prototype.snap = function(){ return this.snaps.length ? this.snaps[this.idx] : null; };
+Pane.prototype.setDevice = function(id, idx){
+  var self = this; self.id = id; self.dev.value = idToLabel[id] || "";
+  clear(self.sel); self.meta.textContent = "Loading..."; self.warn.textContent = "";
+  return loadDevice(id).then(function(arr){
+    self.snaps = arr; self.idx = Math.max(0, Math.min(idx || 0, arr.length - 1));
+    arr.forEach(function(sn, i){
+      var o = document.createElement("option"); o.value = i;
+      o.textContent = (i === 0 ? "latest · " : "") + fmtTs(sn.at) + " · " + (sn.cb ? "by " + sn.cb : "user unknown") + (sn.bl ? " · baseline" : "");
+      self.sel.appendChild(o);
+    });
+    self.sel.disabled = !arr.length; if(!arr.length){ var o = document.createElement("option"); o.textContent = "(no snapshots yet)"; self.sel.appendChild(o); }
+    else self.sel.value = self.idx;
+    self.paint();
+  }, function(err){ self.snaps = []; self.meta.textContent = ""; self.warn.textContent = String(err.message || err); });
+};
+Pane.prototype.paint = function(){
+  var d = byId[this.id], s = this.snap(), w = [];
+  if(s){
+    this.meta.textContent = "Collected " + fmtTs(s.at) + " · device last change: " + (s.ca || "unknown") + (s.cb ? " by " + s.cb : "") +
+      (s.nv ? " · NVRAM saved " + s.nv : "") + " · " + s.lines.length + " lines (" + fmtSize(s.sz) + ")";
+  } else this.meta.textContent = d ? "No config snapshot has been stored for this device yet." : "";
+  if(d && d.er) w.push("Last pull failed " + fmtTs(d.ea) + ": " + d.er + (d.ok ? " (last success " + fmtTs(d.ok) + ")" : ""));
+  this.warn.textContent = w.join(" ");
+};
+
+var left = new Pane("L"), right = new Pane("R");
+var mode = "compare";
+
+/* ---------- diff (Myers, line based) ---------- */
+function myers(A, a0, a1, B, b0, b1){
+  var N = a1 - a0, M = b1 - b0, out = [], i, j;
+  if(N === 0){ for(j = b0; j < b1; j++) out.push(["+", -1, j]); return out; }
+  if(M === 0){ for(i = a0; i < a1; i++) out.push(["-", i, -1]); return out; }
+  var MAX = N + M, LIMIT = Math.min(MAX, 4000), off = MAX + 1;
+  var v = new Int32Array(2 * MAX + 3), trace = [], found = -1, d, k, x, y;
+  for(d = 0; d <= LIMIT; d++){
+    trace.push(v.slice(off - d - 1, off + d + 2));
+    for(k = -d; k <= d; k += 2){
+      if(k === -d || (k !== d && v[off + k - 1] < v[off + k + 1])) x = v[off + k + 1]; else x = v[off + k - 1] + 1;
+      y = x - k;
+      while(x < N && y < M && A[a0 + x] === B[b0 + y]){ x++; y++; }
+      v[off + k] = x;
+      if(x >= N && y >= M){ found = d; break; }
+    }
+    if(found >= 0) break;
+  }
+  if(found < 0) return null;
+  x = N; y = M;
+  for(d = found; d >= 0; d--){
+    var tv = trace[d], prevK;
+    k = x - y;
+    if(k === -d || (k !== d && tv[k - 1 + d + 1] < tv[k + 1 + d + 1])) prevK = k + 1; else prevK = k - 1;
+    var prevX = tv[prevK + d + 1], prevY = prevX - prevK;
+    while(x > prevX && y > prevY){ x--; y--; out.push(["=", a0 + x, b0 + y]); }
+    if(d > 0){ if(x === prevX){ y--; out.push(["+", -1, b0 + y]); } else { x--; out.push(["-", a0 + x, -1]); } }
+    x = prevX; y = prevY;
+  }
+  out.reverse(); return out;
+}
+function diffLines(a, b){
+  var ids = new Map(), nid = 0;
+  function enc(arr){ var o = new Int32Array(arr.length); for(var i = 0; i < arr.length; i++){ var v = ids.get(arr[i]); if(v === undefined){ v = nid++; ids.set(arr[i], v); } o[i] = v; } return o; }
+  var A = enc(a), B = enc(b), n = A.length, m = B.length, pre = 0, i;
+  while(pre < n && pre < m && A[pre] === B[pre]) pre++;
+  var sa = n, sb = m;
+  while(sa > pre && sb > pre && A[sa - 1] === B[sb - 1]){ sa--; sb--; }
+  var ops = [], tooBig = false;
+  for(i = 0; i < pre; i++) ops.push(["=", i, i]);
+  var mid = myers(A, pre, sa, B, pre, sb);
+  if(mid === null){
+    tooBig = true; mid = [];
+    for(i = pre; i < sa; i++) mid.push(["-", i, -1]);
+    for(i = pre; i < sb; i++) mid.push(["+", -1, i]);
+  }
+  for(i = 0; i < mid.length; i++) ops.push(mid[i]);
+  for(i = 0; i < n - sa; i++) ops.push(["=", sa + i, sb + i]);
+  return { ops: ops, tooBig: tooBig };
+}
+function buildRows(ops){
+  var rows = [], dels = [], adds = [];
+  function flush(){
+    var n = Math.max(dels.length, adds.length);
+    for(var i = 0; i < n; i++){
+      var hasD = i < dels.length, hasA = i < adds.length;
+      rows.push({ t: hasD && hasA ? "mod" : hasD ? "del" : "add", a: hasD ? dels[i] : -1, b: hasA ? adds[i] : -1 });
+    }
+    dels = []; adds = [];
+  }
+  ops.forEach(function(op){
+    if(op[0] === "="){ flush(); rows.push({ t: "eq", a: op[1], b: op[2] }); }
+    else if(op[0] === "-") dels.push(op[1]); else adds.push(op[2]);
+  });
+  flush(); return rows;
+}
+function sectionIndex(lines){
+  var out = new Array(lines.length), cur = "";
+  for(var i = 0; i < lines.length; i++){ var c = lines[i].charAt(0); if(c && c !== " " && c !== "!") cur = lines[i]; out[i] = cur; }
+  return out;
+}
+
+/* ---------- compare view ---------- */
+var chgEls = [], chgPos = -1;
+function codeCell(cls, text, hlFrom, hlTo, hlCls){
+  var td = el("td", "code " + cls);
+  if(hlFrom != null && hlTo > hlFrom){
+    td.appendChild(document.createTextNode(text.slice(0, hlFrom)));
+    td.appendChild(el("span", "hl " + hlCls, text.slice(hlFrom, hlTo)));
+    td.appendChild(document.createTextNode(text.slice(hlTo)));
+  } else td.textContent = text;
+  return td;
+}
+function renderCompare(){
+  var out = $("out"); clear(out); chgEls = []; chgPos = -1; $("stats").textContent = "";
+  var L = left.snap(), R = right.snap();
+  if(!L || !R){ out.appendChild(el("div", "empty", "Pick a device and a snapshot on each side. (A device with no stored snapshot has nothing to show yet.)")); return; }
+  var res = diffLines(L.lines, R.lines), rows = buildRows(res.ops);
+  var adds = 0, dels = 0, blocks = 0, prevChg = false;
+  rows.forEach(function(r){
+    if(r.t !== "eq"){ if(r.b >= 0) adds++; if(r.a >= 0) dels++; if(!prevChg) blocks++; prevChg = true; } else prevChg = false;
+  });
+  var st = $("stats"); clear(st);
+  st.appendChild(el("span", "stat add", "+" + adds)); st.appendChild(document.createTextNode(" "));
+  st.appendChild(el("span", "stat del", "−" + dels)); st.appendChild(document.createTextNode(" "));
+  st.appendChild(el("span", "stat", blocks + " change block" + (blocks === 1 ? "" : "s")));
+  if(res.tooBig) out.appendChild(el("div", "banner bad", "These two configs are too different to align line by line, so everything between the matching start and end is shown as replaced."));
+  if(!blocks){ out.appendChild(el("div", "banner ok", "No differences. The two configs are identical (after the volatile header lines are removed).")); return; }
+
+  var ctxv = $("ctx").value, ctx = ctxv === "all" ? Infinity : parseInt(ctxv, 10);
+  var vis = new Array(rows.length), i, j;
+  for(i = 0; i < rows.length; i++) vis[i] = ctx === Infinity;
+  if(ctx !== Infinity) for(i = 0; i < rows.length; i++) if(rows[i].t !== "eq")
+    for(j = Math.max(0, i - ctx); j <= Math.min(rows.length - 1, i + ctx); j++) vis[j] = true;
+  var secL = sectionIndex(L.lines), secR = sectionIndex(R.lines);
+
+  function rowEl(r){
+    var tr = el("tr", r.t), lt = r.a >= 0 ? L.lines[r.a] : "", rt = r.b >= 0 ? R.lines[r.b] : "";
+    tr.appendChild(el("td", "ln", r.a >= 0 ? String(r.a + 1) : ""));
+    if(r.t === "eq"){ tr.appendChild(codeCell("left", lt)); }
+    else if(r.t === "mod"){
+      var p = 0, q = 0; while(p < lt.length && p < rt.length && lt.charAt(p) === rt.charAt(p)) p++;
+      while(q < lt.length - p && q < rt.length - p && lt.charAt(lt.length - 1 - q) === rt.charAt(rt.length - 1 - q)) q++;
+      tr.appendChild(codeCell("left del", lt, p, lt.length - q, "del"));
+    }
+    else if(r.t === "del") tr.appendChild(codeCell("left del", lt));
+    else tr.appendChild(codeCell("left blank", ""));
+    tr.appendChild(el("td", "ln", r.b >= 0 ? String(r.b + 1) : ""));
+    if(r.t === "eq") tr.appendChild(codeCell("right", rt));
+    else if(r.t === "mod"){
+      var p2 = 0, q2 = 0; while(p2 < lt.length && p2 < rt.length && lt.charAt(p2) === rt.charAt(p2)) p2++;
+      while(q2 < lt.length - p2 && q2 < rt.length - p2 && lt.charAt(lt.length - 1 - q2) === rt.charAt(rt.length - 1 - q2)) q2++;
+      tr.appendChild(codeCell("right add", rt, p2, rt.length - q2, "add"));
+    }
+    else if(r.t === "add") tr.appendChild(codeCell("right add", rt));
+    else tr.appendChild(codeCell("right blank", ""));
+    return tr;
+  }
+  function gapRow(s, e){
+    var tr = el("tr", "gap"), td = el("td", null, "⋯ " + (e - s) + " unchanged line" + (e - s === 1 ? "" : "s") + " (click to show)");
+    td.colSpan = 4; tr.appendChild(td);
+    tr.addEventListener("click", function(){
+      var parent = tr.parentNode;
+      for(var k = s; k < e; k++) parent.insertBefore(rowEl(rows[k]), tr);
+      parent.removeChild(tr);
+    });
+    return tr;
+  }
+  var table = el("table", "diff"), tb = el("tbody"), lastLabel = null, inChange = false;
+  table.appendChild(tb);
+  i = 0;
+  while(i < rows.length){
+    if(vis[i]){
+      var r = rows[i], first = null;
+      if(r.t !== "eq"){
+        if(!inChange){
+          inChange = true;
+          var label = r.b >= 0 ? secR[r.b] : secL[r.a];
+          if(label && label !== lastLabel){
+            var sr = el("tr", "sec"), sc = el("td", null, "§ " + label); sc.colSpan = 4; sr.appendChild(sc); tb.appendChild(sr); first = sr;
+          }
+          lastLabel = label;
+          var tr0 = rowEl(r); tb.appendChild(tr0); chgEls.push(first || tr0);
+        } else tb.appendChild(rowEl(r));
+      } else { inChange = false; tb.appendChild(rowEl(r)); }
+      i++;
+    } else {
+      j = i; while(j < rows.length && !vis[j]) j++;
+      tb.appendChild(gapRow(i, j)); i = j; inChange = false;
+    }
+  }
+  out.appendChild(table);
+}
+function jumpChange(dir){
+  if(mode !== "compare" || !chgEls.length) return;
+  chgPos = chgPos < 0 ? (dir > 0 ? 0 : chgEls.length - 1) : (chgPos + dir + chgEls.length) % chgEls.length;
+  var e = chgEls[chgPos]; e.scrollIntoView({ block: "center" });
+  e.classList.add("flash"); setTimeout(function(){ e.classList.remove("flash"); }, 900);
+}
+
+/* ---------- tree view ---------- */
+function parseTree(lines){
+  var root = { ch: [], ind: -1 }, stack = [root];
+  for(var i = 0; i < lines.length; i++){
+    var raw = lines[i], t = raw.trim();
+    if(!t || t === "!") continue;
+    var ind = raw.length - raw.replace(/^\s+/, "").length;
+    var node = { t: t, n: i + 1, ind: ind, ch: [], chg: false, hit: false };
+    while(stack[stack.length - 1].ind >= ind) stack.pop();
+    stack[stack.length - 1].ch.push(node); stack.push(node);
+  }
+  return root;
+}
+function countNodes(n){ var c = 0; n.ch.forEach(function(k){ c += 1 + countNodes(k); }); return c; }
+function markChanged(node, set){
+  var any = set.has(node.n);
+  node.ch.forEach(function(k){ if(markChanged(k, set)) any = true; });
+  node.chg = any; return any;
+}
+function markSearch(node, q){
+  var self = q ? (node.t ? node.t.toLowerCase().indexOf(q) >= 0 : false) : true, any = false;
+  node.ch.forEach(function(k){ if(markSearch(k, q)) any = true; });
+  node.hit = self || any; node.self = q ? self : false; return node.hit;
+}
+function addHighlighted(parent, text, q){
+  if(!q){ parent.appendChild(document.createTextNode(text)); return; }
+  var low = text.toLowerCase(), pos = 0, at;
+  while((at = low.indexOf(q, pos)) >= 0){
+    if(at > pos) parent.appendChild(document.createTextNode(text.slice(pos, at)));
+    parent.appendChild(el("mark", null, text.slice(at, at + q.length))); pos = at + q.length;
+  }
+  if(pos < text.length) parent.appendChild(document.createTextNode(text.slice(pos)));
+}
+function renderTree(){
+  var out = $("out"); clear(out); $("tstats").textContent = "";
+  var S = left.snap();
+  if(!S){ out.appendChild(el("div", "empty", "Pick a device and snapshot above. (A device with no stored snapshot has nothing to show yet.)")); return; }
+  var root = parseTree(S.lines), q = $("tsearch").value.trim().toLowerCase();
+  if(q.length < 2) q = "";
+  var useMark = $("t-mark").checked, only = $("t-only").checked, nChg = 0;
+  if(useMark && left.idx + 1 < left.snaps.length){
+    var prev = left.snaps[left.idx + 1], res = diffLines(prev.lines, S.lines), set = new Set();
+    res.ops.forEach(function(op){ if(op[0] === "+") set.add(op[2] + 1); });
+    markChanged(root, set); nChg = set.size;
+    var info = $("tstats"); info.appendChild(el("span", "stat", nChg + " line(s) changed vs " + fmtTs(prev.at)));
+  } else { markChanged(root, new Set()); if(useMark) $("tstats").appendChild(el("span", "stat", "no earlier snapshot to compare with")); }
+  markSearch(root, q);
+  var expanded = !!q;
+  function build(node, container){
+    node.ch.forEach(function(k){
+      if(q && !k.hit) return;
+      if(only && useMark && !k.chg) return;
+      if(!k.ch.length){
+        var ln = el("div", "line" + (k.chg && useMark ? " chg" : "")); addHighlighted(ln, k.t, q); container.appendChild(ln); return;
+      }
+      var det = el("details", k.chg && useMark ? "chg" : null), sum = el("summary");
+      addHighlighted(sum, k.t, q); sum.appendChild(el("span", "count", countNodes(k) + " line" + (countNodes(k) === 1 ? "" : "s")));
+      det.appendChild(sum); if(expanded) det.open = true;
+      var kids = el("div", "kids"); build(k, kids); det.appendChild(kids); container.appendChild(det);
+    });
+  }
+  var box = el("div", "tree"); build(root, box);
+  if(!box.firstChild) box.appendChild(el("div", "empty", q ? "Nothing matches that search." : "Nothing to show."));
+  out.appendChild(box);
+}
+function setAllOpen(open){ document.querySelectorAll("#out details").forEach(function(d){ d.open = open; }); }
+
+/* ---------- wiring ---------- */
+function rerender(){ if(mode === "compare") renderCompare(); else renderTree(); updateUrl(); }
+function updateUrl(){
+  try {
+    var p = new URLSearchParams(); if(right.id != null) p.set("d", right.id);
+    if(mode === "tree"){ p.set("v", "tree"); if(left.id != null) p.set("d", left.id); }
+    history.replaceState(null, "", "?" + p.toString());
+  } catch(e) {}
+}
+function findDevice(text){
+  var t = text.trim().toLowerCase();
+  if(!t) return { n: 0 };
+  if(Object.prototype.hasOwnProperty.call(labelToId, text)) return { id: labelToId[text], n: 1 };
+  var exact = IDX.filter(function(d){ return d.h.toLowerCase() === t; });
+  if(exact.length === 1) return { id: exact[0].id, n: 1 };
+  var part = IDX.filter(function(d){ return (d.h + " " + (d.sn || d.s)).toLowerCase().indexOf(t) >= 0; });
+  if(part.length === 1) return { id: part[0].id, n: 1 };
+  return { n: part.length };
+}
+function paneDeviceChanged(pane, otherDefaultIdx){
+  var found = findDevice(pane.dev.value);
+  if(found.id === undefined){
+    var typed = pane.dev.value.trim();
+    pane.dev.value = pane.id != null ? (idToLabel[pane.id] || "") : "";
+    pane.warn.textContent = !typed ? "" : found.n > 1 ? found.n + " devices match '" + typed + "'. Pick one from the list." : "No device matches '" + typed + "'.";
+    return;
+  }
+  pane.setDevice(found.id, otherDefaultIdx || 0).then(rerender);
+}
+left.dev.addEventListener("change", function(){ paneDeviceChanged(left, 0); });
+right.dev.addEventListener("change", function(){ paneDeviceChanged(right, 0); });
+[left, right].forEach(function(p){
+  p.dev.addEventListener("focus", function(){ p.dev.select(); });
+  p.sel.addEventListener("change", function(){ p.idx = parseInt(p.sel.value, 10) || 0; p.paint(); rerender(); });
+});
+$("b-prev").addEventListener("click", function(){
+  if(right.id == null) return;
+  var idx = Math.min(right.idx + 1, right.snaps.length - 1);
+  left.setDevice(right.id, idx).then(rerender);
+});
+$("b-swap").addEventListener("click", function(){
+  var li = left.id, lx = left.idx, ri = right.id, rx = right.idx;
+  if(li == null || ri == null) return;
+  left.setDevice(ri, rx).then(function(){ return right.setDevice(li, lx); }).then(rerender);
+});
+$("ctx").addEventListener("change", rerender);
+$("b-nc").addEventListener("click", function(){ jumpChange(1); });
+$("b-pc").addEventListener("click", function(){ jumpChange(-1); });
+document.addEventListener("keydown", function(e){
+  var tag = (e.target && e.target.tagName) || ""; if(tag === "INPUT" || tag === "SELECT" || e.ctrlKey || e.metaKey) return;
+  if(e.key === "n") jumpChange(1); else if(e.key === "p") jumpChange(-1);
+});
+var tTimer = null;
+$("tsearch").addEventListener("input", function(){ clearTimeout(tTimer); tTimer = setTimeout(renderTree, 200); });
+$("t-mark").addEventListener("change", renderTree); $("t-only").addEventListener("change", renderTree);
+$("t-expand").addEventListener("click", function(){ setAllOpen(true); });
+$("t-collapse").addEventListener("click", function(){ setAllOpen(false); });
+function setMode(m){
+  mode = m; document.body.className = "mode-" + m;
+  $("m-compare").className = m === "compare" ? "on" : ""; $("m-tree").className = m === "tree" ? "on" : "";
+  $("tb-compare").hidden = m !== "compare"; $("tb-tree").hidden = m !== "tree";
+  $("L-title").textContent = m === "compare" ? "Older" : "Config";
+  rerender();
+}
+$("m-compare").addEventListener("click", function(){ setMode("compare"); });
+$("m-tree").addEventListener("click", function(){ setMode("tree"); });
+
+/* ---------- start ---------- */
+(function init(){
+  if(!IDX.length){
+    $("out").appendChild(el("div", "empty", "No config data yet. Run a config collection, then Generate dashboard."));
+    return;
+  }
+  var q = new URLSearchParams(location.search), want = parseInt(q.get("d"), 10), start = null;
+  if(byId[want]) start = want;
+  if(start === null) for(var i = 0; i < IDX.length; i++) if(IDX[i].n >= 2){ start = IDX[i].id; break; }
+  if(start === null) for(var j = 0; j < IDX.length; j++) if(IDX[j].n >= 1){ start = IDX[j].id; break; }
+  if(start === null) start = IDX[0].id;
+  var tree = q.get("v") === "tree";
+  right.setDevice(start, 0)
+    .then(function(){ return left.setDevice(start, tree ? 0 : 1); })
+    .then(function(){ setMode(tree ? "tree" : "compare"); });
+})();
+})();
+</script>
+</body>
+</html>
