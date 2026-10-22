@@ -381,7 +381,7 @@ def build_topology_data(conn, site_id: int, site_last_cdp_discovery=None):
 # Site page
 # ---------------------------------------------------------------------
 
-def render_device_list_html(devices_rows, site_last_cdp_discovery) -> str:
+def render_device_list_html(devices_rows, site_last_cdp_discovery, config_device_ids=frozenset()) -> str:
     rows_html = []
     for d in devices_rows:
         roles = []
@@ -394,6 +394,9 @@ def render_device_list_html(devices_rows, site_last_cdp_discovery) -> str:
         stale_badge = ""
         if _device_is_stale(d, site_last_cdp_discovery):
             stale_badge = '<span class="badge stale">stale</span>'
+        config_badge = ""
+        if d["id"] in config_device_ids:
+            config_badge = f'<a class="badge cfg" href="configs.html?d={d["id"]}" title="View this device\'s saved configs">config</a>'
         rows_html.append(f'''
     <div class="row">
       <div class="main">
@@ -403,6 +406,7 @@ def render_device_list_html(devices_rows, site_last_cdp_discovery) -> str:
       <div class="badges">
         {"".join(roles)}
         {stale_badge}
+        {config_badge}
         <span class="badge {source_cls}">{source_label}</span>
       </div>
     </div>''')
@@ -705,6 +709,12 @@ def _render_arp_row(entry) -> str:
 def render_site_page(conn, site_row) -> str:
     site_id = site_row["id"]
     devices_rows = sorted(db.get_devices_for_site(conn, site_id), key=lambda d: _ip_sort_key(d["mgmt_ip"]))
+    try:
+        config_device_ids = {r[0] for r in conn.execute(
+            "SELECT DISTINCT cs.device_id FROM config_snapshots cs JOIN devices d ON d.id = cs.device_id WHERE d.site_id = ?",
+            (site_id,))}
+    except Exception:
+        config_device_ids = set()
     arp_rows = db.get_arp_for_site(conn, site_id)
     client_rows = db.get_clients_for_site(conn, site_id)
     tunnel_interface_rows = db.get_tunnel_interfaces_for_site(conn, site_id)
@@ -812,6 +822,8 @@ details:not([open]) > .panel-head .chevron, details:not([open]) > .vrf-group-hea
 .badge.source-manual{{ color:var(--accent); border-color:var(--accent-dim); }}
 .badge.role{{ color:var(--accent); border-color:var(--accent-dim); }}
 .badge.stale{{ color:var(--text-dim); border-style:dashed; }}
+.badge.cfg{{ color:var(--accent); border-color:var(--accent-dim); text-decoration:none; }}
+.badge.cfg:hover{{ border-color:var(--accent); }}
 .badge.tunnel-matched{{ color:var(--up); border-color:color-mix(in srgb, var(--up) 40%, var(--border)); }}
 .badge.tunnel-one-sided{{ color:var(--warn); border-color:color-mix(in srgb, var(--warn) 40%, var(--border)); }}
 .badge.tunnel-down{{ color:var(--warn); border-color:color-mix(in srgb, var(--warn) 40%, var(--border)); }}
@@ -858,7 +870,7 @@ footer{{ margin-top:20px; font-family:var(--mono); font-size:11px; color:var(--t
 
   <details class="panel" open>
     <summary class="panel-head"><span class="label"><span class="chevron">\u25b8</span>Devices</span><span class="count">{len(devices_rows)} total</span></summary>
-    <div>{render_device_list_html(devices_rows, site_row["last_cdp_discovery"])}</div>
+    <div>{render_device_list_html(devices_rows, site_row["last_cdp_discovery"], config_device_ids)}</div>
   </details>
 
   <details class="panel" open>
@@ -1019,6 +1031,7 @@ footer{{ margin-top:20px; font-family:var(--mono); font-size:11px; color:var(--t
       <a class="btn" href="site-map.html">Site Map</a>
       <a class="btn" href="clients.html">Search Clients</a>
       <a class="btn" href="exports.html">Exports</a>
+      <a class="btn" href="configs.html">Configs</a>
       <a class="btn" href="site-unassigned.html">Unassigned ({unassigned_count})</a>
       <button class="icon-btn" id="theme-toggle" title="Toggle theme">\U0001F319</button>
     </div>

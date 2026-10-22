@@ -79,7 +79,7 @@ def generate_config_pages(conn, site_id: int = None, out_dir: str = None) -> dic
 
     devices = conn.execute(
         """
-        SELECT d.id, d.hostname, d.site_id, s.site_octet, s.site_name,
+        SELECT d.id, d.hostname, d.mgmt_ip, d.platform, d.serial_number, d.site_id, s.site_octet, s.site_name,
                agg.n, agg.latest_id, agg.oldest_id,
                snap.collected_at AS latest_at, snap.changed_at AS latest_changed_at, snap.changed_by AS latest_changed_by,
                st.last_attempt_at, st.last_success_at, st.last_error
@@ -102,12 +102,15 @@ def generate_config_pages(conn, site_id: int = None, out_dir: str = None) -> dic
         live_ids.add(str(d["id"]))
         index.append({
             "id": d["id"], "h": d["hostname"], "s": d["site_octet"], "sn": d["site_name"] or "",
+            "ip": d["mgmt_ip"] or "", "pl": d["platform"] or "", "se": d["serial_number"] or "",
             "n": n, "c": d["latest_at"], "ca": d["latest_changed_at"], "cb": d["latest_changed_by"],
             "ok": d["last_success_at"], "ea": d["last_attempt_at"], "er": d["last_error"],
         })
         if not n:
             continue
         dev_path = os.path.join(data_dir, f"dev_{d['id']}.js")
+        # A one-site run leaves other sites' existing files alone, but still builds any that
+        # are missing so the device index never points at a file that does not exist.
         if site_id is not None and d["site_id"] != site_id and os.path.exists(dev_path):
             continue
         sig = f"{config_parser.REDACTION_VERSION}:{d['latest_id']}:{d['oldest_id']}:{n}"

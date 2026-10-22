@@ -17,8 +17,10 @@ _VOLATILE = [
     re.compile(r"^Using \d+ out of \d+ bytes.*$"),
     re.compile(r"^!\s*No configuration change since last restart\s*$"),
     re.compile(r"^ntp clock-period \d+\s*$"),
-    re.compile(r"^!Command: show running-config.*$"),
-    re.compile(r"^!Time: .*$"),
+    re.compile(r"^!\s*Command\s*:\s*show running-config.*$", re.I),
+    re.compile(r"^!\s*Time\s*:.*$", re.I),
+    re.compile(r"^!\s*Startup config saved at\s*:?.*$", re.I),
+    re.compile(r"^!\s*Running configuration last done at\s*:?.*$", re.I),
 ]
 # "! Last configuration change at <time> by <user>" (IOS/IOS-XE)
 _LAST_CHANGE = re.compile(r"^!\s*Last configuration change at (?P<when>.+?)(?:\s+by\s+(?P<who>\S+))?\s*$")
@@ -38,7 +40,7 @@ def clean_config(raw: str) -> dict:
         result["problem"] = "empty output from 'show running-config'"
         return result
 
-    nxos = any(ln.startswith("!Command:") or ln.startswith("!Running configuration last done") for ln in lines)
+    nxos = any(re.match(r"^!\s*Command\s*:", ln) or re.match(r"^!\s*Running configuration last done", ln) for ln in lines)
     kept = []
     for ln in lines:
         m = _LAST_CHANGE.match(ln)
@@ -162,6 +164,11 @@ if __name__ == "__main__":
     r = clean_config(nx)
     assert r["problem"] is None and r["changed_by"] is None and r["changed_at"] == "Mon Oct 19 14:22:01 2026", r
 
+    for variant in ("!Time: Tue Oct 20 09:30:01 2026", "!Time:Tue Oct 20 09:30:01 2026", "! Time: Tue Oct 20 09:30:01 2026", "!TIME : x", "!Startup config saved at: Tue Oct 20 09:30:01 2026"):
+        v = clean_config(nx.replace("!Time: Tue Oct 20 09:30:01 2026", variant))
+        assert v["problem"] is None and "Time" not in v["text"] and "Startup" not in v["text"], (variant, v)
+        assert v["text"] == clean_config(nx)["text"], variant
+
     assert clean_config("% Invalid input detected at '^' marker.\n")["problem"]
     assert clean_config("")["problem"]
     assert "cut off" in clean_config("version 15.2\nhostname sw1\ninterface Gi1\n")["problem"]
@@ -197,7 +204,6 @@ if __name__ == "__main__":
     assert "PrivPass456" not in redact_config(list(cases)[20])[0]
     keep = ["key chain KC", " key 1", "  key-string", "hostname sw1", "interface Gi1/0/1", " description uplink key switch",
             " ip ospf authentication message-digest", "snmp-server contact NOC", "tacacs-server timeout 5", "aaa authentication login default group tacacs+ local"]
-    
     for line in keep:
         assert redact_config(line)[0] == line, line
     a, _ = redact_config("enable secret 9 $9$same$one"); b, _ = redact_config("enable secret 9 $9$same$one")
