@@ -409,6 +409,9 @@ function renderCompare(){
     return tr;
   }
   var table = el("table", "diff"), tb = el("tbody"), lastLabel = null, inChange = false;
+  var cg = el("colgroup");
+  ["58px", "", "58px", ""].forEach(function(w){ var c = el("col"); if(w) c.style.width = w; cg.appendChild(c); });
+  table.appendChild(cg);
   table.appendChild(tb);
   i = 0;
   while(i < rows.length){
