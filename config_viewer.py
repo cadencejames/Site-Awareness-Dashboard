@@ -27,6 +27,7 @@ sys.path.insert(0, os.path.join(HERE, "utilities"))
 
 import db  # noqa: E402
 import config_parser  # noqa: E402
+import banner  # noqa: E402
 
 OUTPUT_DIR = os.path.join(HERE, "dashboard")
 DATA_DIRNAME = "configs"
@@ -143,7 +144,7 @@ def generate_config_pages(conn, site_id: int = None, out_dir: str = None) -> dic
     _write_atomic(os.path.join(data_dir, "index.js"),
                   f"window.CFG_GENERATED={_dump(stamp)};\nwindow.CFG_INDEX={_dump(index)};\n")
     with open(TEMPLATE_PATH, encoding="utf-8") as f:
-        page = f.read().replace("__CSS_TOKENS__", CSS_TOKENS)
+        page = f.read().replace("__CSS_TOKENS__", CSS_TOKENS).replace("__BANNER_CSS__", banner.CSS).replace("__BANNER__", banner.html())
     _write_atomic(os.path.join(out_dir, "configs.html"), page)
     return stats
 

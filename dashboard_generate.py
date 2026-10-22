@@ -28,6 +28,7 @@ import topology_svg  # noqa: E402
 import site_map_layout  # noqa: E402
 import site_map_svg  # noqa: E402
 import mac_parser  # noqa: E402
+import banner  # noqa: E402
 
 OUTPUT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "dashboard")
 
@@ -849,9 +850,11 @@ td{{ padding:5px 12px; border-bottom:1px solid var(--border); }}
 tr:last-child td{{ border-bottom:none; }}
 tr:hover td{{ background:var(--panel-2); }}
 footer{{ margin-top:20px; font-family:var(--mono); font-size:11px; color:var(--text-dim); text-align:center; }}
+{banner.CSS}
 </style>
 </head>
 <body>
+{banner.html()}
 <div class="wrap">
   <a class="backlink" href="index.html">\u2190 All Sites</a>
   <header class="site-header">
@@ -1018,9 +1021,11 @@ button:active, .btn:active{{ transform:scale(.97); }}
 .pill.needs-review{{ border-color:var(--warn); color:var(--warn); }}
 .row .runinfo{{ font-family:var(--mono); font-size:11px; color:var(--text-dim); text-align:right; flex:none; width:150px; }}
 footer{{ margin-top:20px; font-family:var(--mono); font-size:11px; color:var(--text-dim); text-align:center; }}
+{banner.CSS}
 </style>
 </head>
 <body>
+{banner.html()}
 <div class="wrap">
   <header>
     <div>
@@ -1291,9 +1296,11 @@ button:hover, .btn:hover{{ border-color:var(--accent); }}
 .badge.dup{{ color:var(--accent); border-color:var(--accent-dim); }}
 .empty{{ font-family:var(--mono); font-size:13px; color:var(--text-dim); padding:20px; text-align:center; }}
 footer{{ margin-top:20px; font-family:var(--mono); font-size:11px; color:var(--text-dim); text-align:center; }}
+{banner.CSS}
 </style>
 </head>
 <body>
+{banner.html()}
 <div class="wrap">
   <a class="backlink" href="index.html">← All Sites</a>
   <header>
@@ -1587,9 +1594,11 @@ button:active, .btn:active{{ transform:scale(.97); }}
 .legend-dot.stale{{ border-color:var(--warn); }}
 .legend-dot.none{{ border-color:var(--border); border-style:dashed; }}
 footer{{ margin-top:20px; font-family:var(--mono); font-size:11px; color:var(--text-dim); text-align:center; }}
+{banner.CSS}
 </style>
 </head>
 <body>
+{banner.html()}
 <div class="wrap">
   <a class="backlink" href="index.html">\u2190 All Sites</a>
   <header>
@@ -1751,9 +1760,11 @@ h1{{ font-size:22px; margin:0 0 4px; }}
 .enrich-row:last-child{{ border-bottom:none; }}
 .enrich-row span:first-child{{ color:var(--text-dim); }}
 footer{{ margin-top:20px; font-family:var(--mono); font-size:11px; color:var(--text-dim); text-align:center; }}
+{banner.CSS}
 </style>
 </head>
 <body>
+{banner.html()}
 <div class="wrap">
   <a class="backlink" href="index.html">\u2190 All Sites</a>
   <header>
@@ -1966,9 +1977,11 @@ button:hover, .btn:hover{{ border-color:var(--accent); }}
 .row .name{{ font-family:var(--mono); font-size:13px; font-weight:600; }}
 .row .meta{{ font-family:var(--mono); font-size:11.5px; color:var(--text-dim); white-space:nowrap; }}
 footer{{ margin-top:20px; font-family:var(--mono); font-size:11px; color:var(--text-dim); text-align:center; }}
+{banner.CSS}
 </style>
 </head>
 <body>
+{banner.html()}
 <div class="wrap">
   <a class="backlink" href="index.html">\u2190 All Sites</a>
   <header>
