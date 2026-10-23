@@ -42,7 +42,7 @@ ERROR_TEXT = "CLASSIFICATION SETTING UNREADABLE (check settings.json)"
 SETTINGS_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "settings.json")
 
 CSS = (
-    ".banner{position:sticky;top:0;z-index:50;text-align:center;font-weight:700;"
+    ".class-banner{position:sticky;top:0;z-index:50;text-align:center;font-weight:700;"
     "letter-spacing:.08em;padding:3px 8px;font-size:13px;"
     "-webkit-print-color-adjust:exact;print-color-adjust:exact}"
 )
@@ -115,5 +115,5 @@ def html(text=None):
     if not text:
         return ""
     bg, fg = colors_for(text)
-    return (f'<div class="banner" style="background:{escape(bg, quote=True)};color:{escape(fg, quote=True)}">'
+    return (f'<div class="class-banner" style="background:{escape(bg, quote=True)};color:{escape(fg, quote=True)}">'
             f"{escape(text)}</div>")
