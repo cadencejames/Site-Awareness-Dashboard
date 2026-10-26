@@ -1,4 +1,25 @@
 {
   "classification": "UNCLASSIFIED",
-  "banner_styles": {}
+  "banner_styles": {},
+
+  "gemone": {
+    "script": "gemone/gemone_full_pull.py",
+    "output_file": "gemone/output.json",
+    "site_map_file": "gemone/kg_site_map.csv",
+    "credential_name": "gemone",
+    "run_timeout_seconds": 1800,
+
+    "keymat_warn_days": 30,
+    "keymat_critical_days": 0,
+    "battery_warn_years": 2.0,
+    "battery_critical_years": null,
+
+    "state_health": {
+      "Secure Comm": "ok",
+      "Network Active": "warning"
+    },
+    "interface_down_health": "critical",
+    "unreachable_pairs_warn": false,
+    "data_stale_after_days": 2
+  }
 }

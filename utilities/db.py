@@ -344,6 +344,74 @@ CREATE TABLE IF NOT EXISTS config_pull_status (
 );
 
 CREATE INDEX IF NOT EXISTS idx_config_snapshots_device ON config_snapshots(device_id, id);
+
+-- GEM One KG (TACLANE) devices, imported from the file gemone_full_pull.py
+-- writes. Kept apart from `devices` on purpose: CDP runs, stale marking and
+-- the config collector never touch these. Health is NOT stored: it is worked
+-- out from these fields and the thresholds in settings.json when displayed.
+CREATE TABLE IF NOT EXISTS kg_devices (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    serial_number       TEXT NOT NULL UNIQUE,
+    site_id             INTEGER REFERENCES sites(id),
+    system_name         TEXT,
+    device_type         TEXT,
+    state               TEXT,
+    software_version    TEXT,
+    pt_ip               TEXT,
+    ct_ip               TEXT,
+    pt_mac              TEXT,
+    ct_mac              TEXT,
+    pt_status           TEXT,
+    ct_status           TEXT,
+    ffvs_exp_date       TEXT,   -- KEYMAT expiry, YYYY-MM-DD
+    battery_change_date TEXT,   -- when the battery was last changed, YYYY-MM-DD
+    data_collected_at   TEXT,   -- the import file's collected_at for this row's data
+    first_seen          TEXT,
+    last_seen           TEXT,   -- the last import this serial was present in
+    missing_since       TEXT,   -- set when a newer file no longer lists it; cleared when it returns
+    last_error          TEXT,   -- the script could not read this device on its last run
+    last_error_at       TEXT,
+    deleted_at          TEXT
+);
+
+CREATE TABLE IF NOT EXISTS kg_security_associations (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    kg_id           INTEGER NOT NULL REFERENCES kg_devices(id),
+    remote_ct       TEXT,
+    remote_pt       TEXT,
+    method          TEXT,
+    pair_reachable  INTEGER   -- 1 yes, 0 no, NULL unknown
+);
+
+-- Which site a KG belongs to, by serial number (set by hand or from a CSV; the
+-- GEM One data carries no site). A serial with no row here lands in Unassigned.
+CREATE TABLE IF NOT EXISTS kg_site_map (
+    serial_number TEXT PRIMARY KEY,
+    site_id       INTEGER NOT NULL REFERENCES sites(id)
+);
+
+CREATE TABLE IF NOT EXISTS kg_imports (
+    id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+    imported_at        TEXT NOT NULL,
+    file_collected_at  TEXT,
+    source             TEXT,
+    device_count       INTEGER,
+    added              INTEGER,
+    updated            INTEGER,
+    errors             INTEGER,
+    missing            INTEGER
+);
+
+CREATE TABLE IF NOT EXISTS kg_state_log (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    kg_id      INTEGER NOT NULL REFERENCES kg_devices(id),
+    at         TEXT NOT NULL,
+    old_state  TEXT,
+    new_state  TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_kg_devices_site ON kg_devices(site_id);
+CREATE INDEX IF NOT EXISTS idx_kg_assoc_kg ON kg_security_associations(kg_id);
 CREATE INDEX IF NOT EXISTS idx_devices_site   ON devices(site_id);
 CREATE INDEX IF NOT EXISTS idx_devices_serial ON devices(serial_number);
 CREATE INDEX IF NOT EXISTS idx_links_site     ON links(site_id);
@@ -1868,6 +1936,269 @@ def get_config_snapshots(conn, device_id: int):
 def get_config_snapshot_text(conn, snapshot_id: int):
     row = conn.execute("SELECT config_z FROM config_snapshots WHERE id = ?", (snapshot_id,)).fetchone()
     return zlib.decompress(row["config_z"]).decode("utf-8") if row else None
+
+
+# ---------------------------------------------------------------------
+# GEM One KG (TACLANE) devices - see the kg_* tables in SCHEMA
+# ---------------------------------------------------------------------
+
+def _kg_clean(value):
+    """Stripped text, or None when the value is missing or blank."""
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
+
+
+def _kg_date(value, warnings: list, serial: str, field: str):
+    """A YYYY-MM-DD string (a longer date/time is cut to its date), or None
+    with a warning when the value is present but not a real date."""
+    text = _kg_clean(value)
+    if text is None:
+        return None
+    try:
+        datetime.strptime(text[:10], "%Y-%m-%d")
+        return text[:10]
+    except ValueError:
+        warnings.append(f"{serial}: {field} '{text[:30]}' is not a YYYY-MM-DD date, stored as empty")
+        return None
+
+
+def _kg_bool(value):
+    """1 / 0 for a true or false value (a real boolean, or the text true/false),
+    else None (unknown)."""
+    if isinstance(value, bool):
+        return 1 if value else 0
+    text = _kg_clean(value)
+    if text is None:
+        return None
+    text = text.lower()
+    if text in ("true", "yes", "1"):
+        return 1
+    if text in ("false", "no", "0"):
+        return 0
+    return None
+
+
+def _kg_timestamp(value):
+    """A timestamp as normalized UTC ISO text, or None if it cannot be read."""
+    text = _kg_clean(value)
+    if text is None:
+        return None
+    try:
+        dt = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc).isoformat(timespec="seconds")
+
+
+_KG_FIELDS = (
+    ("system_name", "systemName"), ("device_type", "type"), ("state", "state"),
+    ("software_version", "softwareVersion"), ("pt_ip", "ptIpAddress"), ("ct_ip", "ctIpAddress"),
+    ("pt_mac", "ptMacAddress"), ("ct_mac", "ctMacAddress"),
+    ("pt_status", "ptOperationalStatus"), ("ct_status", "ctOperationalStatus"),
+)
+
+
+def import_kg_snapshot(conn, data: dict, source: str = None, force: bool = False) -> dict:
+    """Applies one gemone_full_pull.py output file (already parsed from JSON)
+    to the kg_* tables. Matching is by serial number: new serials are added,
+    known ones updated (their security associations replaced wholesale), and
+    serials missing from the file are NOT deleted, only marked missing_since.
+    A device listed under the file's "errors" keeps its old data and gets
+    last_error set instead. Returns a summary dict.
+
+    Refuses a file older than the last import, or one listing no devices at
+    all (that would mark everything missing), unless force=True."""
+    if not isinstance(data, dict) or not isinstance(data.get("devices"), list):
+        raise ValueError("GEM One data must be an object with a 'devices' list")
+    now = _now()
+    collected = _kg_timestamp(data.get("collected_at")) or now
+    last = conn.execute("SELECT file_collected_at FROM kg_imports ORDER BY id DESC LIMIT 1").fetchone()
+    if not force:
+        if last is not None and last["file_collected_at"] and collected < last["file_collected_at"]:
+            raise ValueError(
+                f"This file was collected at {collected}, which is older than the last import "
+                f"({last['file_collected_at']}). Use force to import it anyway.")
+        if not data["devices"] and not (data.get("errors") or []):
+            raise ValueError("The file lists no devices. Importing it would mark every KG as missing. "
+                             "Use force to import it anyway.")
+
+    summary = {"file_collected_at": collected, "added": 0, "updated": 0, "reactivated": 0, "skipped": 0,
+               "errors": 0, "missing": 0, "associations": 0, "unmapped": [], "warnings": []}
+    warnings = summary["warnings"]
+    site_map = {r["serial_number"]: r["site_id"] for r in conn.execute("SELECT serial_number, site_id FROM kg_site_map")}
+    known = get_site_by_octet(conn, UNASSIGNED_SITE_OCTET)
+    unassigned = [known["id"] if known is not None else None]
+
+    def unassigned_id():
+        if unassigned[0] is None:
+            unassigned[0] = get_or_create_unassigned_site(conn)
+        return unassigned[0]
+
+    seen = set()
+    for raw in data["devices"]:
+        serial = _kg_clean(raw.get("serialNumber")) if isinstance(raw, dict) else None
+        if not serial:
+            summary["skipped"] += 1
+            warnings.append("a device entry with no serialNumber was skipped")
+            continue
+        if serial in seen:
+            warnings.append(f"{serial}: listed more than once, the last entry was used")
+        seen.add(serial)
+
+        values = {col: _kg_clean(raw.get(key)) for col, key in _KG_FIELDS}
+        values["ffvs_exp_date"] = _kg_date(raw.get("currFfvsExpDate"), warnings, serial, "currFfvsExpDate")
+        values["battery_change_date"] = _kg_date(raw.get("neBatteryChangeDate"), warnings, serial, "neBatteryChangeDate")
+
+        existing = conn.execute("SELECT * FROM kg_devices WHERE serial_number = ?", (serial,)).fetchone()
+        site_id = site_map.get(serial) or (existing["site_id"] if existing is not None and existing["site_id"] else None)
+        if site_id is None:
+            site_id = unassigned_id()
+        if site_id == unassigned[0]:
+            summary["unmapped"].append(serial)
+        values["site_id"] = site_id
+        values["data_collected_at"] = collected
+        values["last_seen"] = now
+
+        if existing is None:
+            cols = ["serial_number", "first_seen"] + list(values)
+            cur = conn.execute(
+                f"INSERT INTO kg_devices ({', '.join(cols)}) VALUES ({', '.join('?' for _ in cols)})",
+                [serial, now] + [values[c] for c in values])
+            kg_id = cur.lastrowid
+            summary["added"] += 1
+            if values["state"]:
+                conn.execute("INSERT INTO kg_state_log (kg_id, at, old_state, new_state) VALUES (?, ?, NULL, ?)",
+                             (kg_id, now, values["state"]))
+        else:
+            kg_id = existing["id"]
+            if existing["deleted_at"]:
+                summary["reactivated"] += 1
+            sets = ", ".join(f"{c} = ?" for c in values)
+            conn.execute(
+                f"UPDATE kg_devices SET {sets}, missing_since = NULL, last_error = NULL, last_error_at = NULL, "
+                f"deleted_at = NULL WHERE id = ?", [values[c] for c in values] + [kg_id])
+            summary["updated"] += 1
+            if (existing["state"] or None) != values["state"]:
+                conn.execute("INSERT INTO kg_state_log (kg_id, at, old_state, new_state) VALUES (?, ?, ?, ?)",
+                             (kg_id, now, existing["state"], values["state"]))
+
+        assoc = raw.get("securityAssociations")
+        if assoc is not None and not isinstance(assoc, list):
+            warnings.append(f"{serial}: securityAssociations is not a list, ignored")
+            assoc = []
+        conn.execute("DELETE FROM kg_security_associations WHERE kg_id = ?", (kg_id,))
+        rows = []
+        for a in assoc or []:
+            if not isinstance(a, dict):
+                continue
+            rows.append((kg_id, _kg_clean(a.get("remoteCtAddress")), _kg_clean(a.get("remotePtAddress")),
+                         _kg_clean(a.get("establishmentMethod")), _kg_bool(a.get("pairReachable"))))
+        conn.executemany(
+            "INSERT INTO kg_security_associations (kg_id, remote_ct, remote_pt, method, pair_reachable) "
+            "VALUES (?, ?, ?, ?, ?)", rows)
+        summary["associations"] += len(rows)
+
+    error_serials = set()
+    for e in data.get("errors") or []:
+        serial = _kg_clean(e.get("serialNumber")) if isinstance(e, dict) else None
+        if not serial:
+            continue
+        error_serials.add(serial)
+        summary["errors"] += 1
+        message = (_kg_clean(e.get("error")) or "lookup failed")[:300]
+        conn.execute("UPDATE kg_devices SET last_error = ?, last_error_at = ?, missing_since = NULL "
+                     "WHERE serial_number = ?", (message, now, serial))
+
+    present = seen | error_serials
+    for row in conn.execute("SELECT id, serial_number FROM kg_devices WHERE deleted_at IS NULL").fetchall():
+        if row["serial_number"] not in present:
+            conn.execute("UPDATE kg_devices SET missing_since = COALESCE(missing_since, ?) WHERE id = ?", (now, row["id"]))
+            summary["missing"] += 1
+
+    conn.execute(
+        "INSERT INTO kg_imports (imported_at, file_collected_at, source, device_count, added, updated, errors, missing) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        (now, collected, source, len(seen), summary["added"], summary["updated"], summary["errors"], summary["missing"]))
+    log_activity("import_kg", f"GEM One file: {summary['added']} added, {summary['updated']} updated, "
+                 f"{summary['errors']} errors, {summary['missing']} missing", conn=conn)
+    return summary
+
+
+def set_kg_site(conn, serial_number: str, site_id: int) -> None:
+    """Assigns a KG to a site by serial number. The assignment is remembered
+    in kg_site_map, so later imports keep it."""
+    serial = _kg_clean(serial_number)
+    if not serial:
+        raise ValueError("A serial number is required")
+    if conn.execute("SELECT 1 FROM sites WHERE id = ?", (site_id,)).fetchone() is None:
+        raise ValueError(f"No site with id {site_id}")
+    conn.execute("INSERT INTO kg_site_map (serial_number, site_id) VALUES (?, ?) "
+                 "ON CONFLICT(serial_number) DO UPDATE SET site_id = excluded.site_id", (serial, site_id))
+    conn.execute("UPDATE kg_devices SET site_id = ? WHERE serial_number = ?", (site_id, serial))
+    log_activity("set_kg_site", f"KG {serial} assigned to site id {site_id}", conn=conn)
+
+
+def import_kg_site_map(conn, rows: list) -> dict:
+    """Bulk-loads serial-to-site assignments. rows: [{"serial": ..., "site": <site octet>}].
+    A site value that matches no known site is reported, not applied."""
+    summary = {"applied": 0, "unknown_site": [], "skipped": 0}
+    for r in rows:
+        serial = _kg_clean(r.get("serial")) if isinstance(r, dict) else None
+        octet = _kg_clean(r.get("site")) if isinstance(r, dict) else None
+        if not serial or not octet:
+            summary["skipped"] += 1
+            continue
+        site = get_site_by_octet(conn, octet)
+        if site is None:
+            summary["unknown_site"].append((serial, octet))
+            continue
+        conn.execute("INSERT INTO kg_site_map (serial_number, site_id) VALUES (?, ?) "
+                     "ON CONFLICT(serial_number) DO UPDATE SET site_id = excluded.site_id", (serial, site["id"]))
+        conn.execute("UPDATE kg_devices SET site_id = ? WHERE serial_number = ?", (site["id"], serial))
+        summary["applied"] += 1
+    log_activity("import_kg_site_map", f"{summary['applied']} KG site assignment(s) loaded", conn=conn)
+    return summary
+
+
+def soft_delete_kg_device(conn, serial_number: str) -> None:
+    """Hides a KG from the pages. It comes back by itself if a later file lists it again."""
+    conn.execute("UPDATE kg_devices SET deleted_at = ? WHERE serial_number = ? AND deleted_at IS NULL",
+                 (_now(), _kg_clean(serial_number)))
+    log_activity("delete_kg", f"KG {serial_number} hidden", conn=conn)
+
+
+def get_kg_devices(conn, site_id: int = None, include_deleted: bool = False):
+    """KG rows (with the site's octet/name and association counts), by name."""
+    where, params = [], []
+    if site_id is not None:
+        where.append("k.site_id = ?")
+        params.append(site_id)
+    if not include_deleted:
+        where.append("k.deleted_at IS NULL")
+    sql = (
+        "SELECT k.*, s.site_octet, s.site_name, "
+        "  (SELECT COUNT(*) FROM kg_security_associations a WHERE a.kg_id = k.id) AS assoc_total, "
+        "  (SELECT COUNT(*) FROM kg_security_associations a WHERE a.kg_id = k.id AND a.pair_reachable = 0) AS assoc_unreachable "
+        "FROM kg_devices k LEFT JOIN sites s ON s.id = k.site_id "
+        + ("WHERE " + " AND ".join(where) + " " if where else "")
+        + "ORDER BY LOWER(COALESCE(k.system_name, k.serial_number)), k.serial_number"
+    )
+    return conn.execute(sql, params).fetchall()
+
+
+def get_kg_associations(conn, kg_id: int):
+    return conn.execute(
+        "SELECT remote_ct, remote_pt, method, pair_reachable FROM kg_security_associations "
+        "WHERE kg_id = ? ORDER BY pair_reachable IS NULL, pair_reachable, remote_ct", (kg_id,)).fetchall()
+
+
+def get_kg_last_import(conn):
+    """The most recent import's row (imported_at, file_collected_at, counts) or None."""
+    return conn.execute("SELECT * FROM kg_imports ORDER BY id DESC LIMIT 1").fetchone()
 
 
 # ---------------------------------------------------------------------
