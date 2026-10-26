@@ -167,6 +167,10 @@ ACTIONS = {
     "match_tunnels": db.match_tunnels,
     "record_config_snapshot": db.record_config_snapshot,
     "record_config_pull_result": db.record_config_pull_result,
+    "import_kg_snapshot": db.import_kg_snapshot,
+    "set_kg_site": db.set_kg_site,
+    "import_kg_site_map": db.import_kg_site_map,
+    "soft_delete_kg_device": db.soft_delete_kg_device,
 }
 
 
