@@ -29,6 +29,7 @@ import site_map_layout  # noqa: E402
 import site_map_svg  # noqa: E402
 import mac_parser  # noqa: E402
 import banner  # noqa: E402
+import kg_pages  # noqa: E402
 
 OUTPUT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "dashboard")
 
@@ -716,6 +717,12 @@ def render_site_page(conn, site_row) -> str:
             (site_id,))}
     except Exception:
         config_device_ids = set()
+    try:
+        kg_panel_html = kg_pages.render_site_panel(conn, site_id)
+    except Exception as e:   # never let a KG problem stop a site page
+        kg_panel_html = f'<div class="panel"><div class="panel-head"><span class="label">KG Devices</span></div><p style="padding:12px 14px;font-family:var(--mono);font-size:12px">KG panel could not be built: {_esc(e)}</p></div>'
+    kg_css = kg_pages.CSS if kg_panel_html else ""
+    kg_js = kg_pages.JS if kg_panel_html else ""
     arp_rows = db.get_arp_for_site(conn, site_id)
     client_rows = db.get_clients_for_site(conn, site_id)
     tunnel_interface_rows = db.get_tunnel_interfaces_for_site(conn, site_id)
@@ -850,6 +857,7 @@ td{{ padding:5px 12px; border-bottom:1px solid var(--border); }}
 tr:last-child td{{ border-bottom:none; }}
 tr:hover td{{ background:var(--panel-2); }}
 footer{{ margin-top:20px; font-family:var(--mono); font-size:11px; color:var(--text-dim); text-align:center; }}
+{kg_css}
 {banner.CSS}
 </style>
 </head>
@@ -871,20 +879,22 @@ footer{{ margin-top:20px; font-family:var(--mono); font-size:11px; color:var(--t
     {expand_panels_html}
   </details>
 
-  <details class="panel" open>
+  <details class="panel">
     <summary class="panel-head"><span class="label"><span class="chevron">\u25b8</span>Devices</span><span class="count">{len(devices_rows)} total</span></summary>
     <div>{render_device_list_html(devices_rows, site_row["last_cdp_discovery"], config_device_ids)}</div>
   </details>
 
-  <details class="panel" open>
+  <details class="panel">
     <summary class="panel-head"><span class="label"><span class="chevron">\u25b8</span>ARP Tables</span><span class="count">{vrf_count} tables · {total_arp} entries</span></summary>
     {render_arp_tables_html(arp_rows, site_row["last_arp_collection"])}
   </details>
 
-  <details class="panel" open>
+  <details class="panel">
     <summary class="panel-head"><span class="label"><span class="chevron">\u25b8</span>Tunnels</span><span class="count">{len(tunnel_interface_rows)} total</span></summary>
     <div>{render_tunnels_html(tunnel_interface_rows, tunnel_link_rows, site_row["last_tunnel_collection"])}</div>
   </details>
+
+  {kg_panel_html}
 
   <details class="panel">
     <summary class="panel-head"><span class="label"><span class="chevron">\u25b8</span>Clients</span><span class="count">{len(client_rows)} total</span></summary>
@@ -898,6 +908,7 @@ function toggleExpand(id){{
   const el = document.getElementById(id);
   el.hidden = !el.hidden;
 }}
+{kg_js}
 {THEME_TOGGLE_JS}
 </script>
 </body>
@@ -923,6 +934,17 @@ def render_index_page(conn) -> str:
     total_links = conn.execute("SELECT COUNT(*) AS c FROM links").fetchone()["c"]
     total_clients = conn.execute("SELECT COUNT(*) AS c FROM clients").fetchone()["c"]
     never_scanned = sum(1 for s in real_sites if not s["last_cdp_discovery"])
+    kg_button_html, kg_tile_html = "", ""
+    try:
+        kgs = kg_pages.summary(conn)
+        if kgs["total"]:
+            kg_button_html = f'<a class="btn" href="kg.html">KG Devices ({kgs["total"]})</a>'
+            kg_cls = "num warn" if kgs["critical"] else "num"
+            kg_label = (f'{kgs["critical"]} critical' if kgs["critical"] else f'{kgs["warning"]} warning' if kgs["warning"] else "all healthy")
+            kg_tile_html = (f'<a class="kpi kpi-link" href="kg.html" title="KG health"><center><div class="{kg_cls}">{kgs["total"]}</div>'
+                            f'<div class="label">KG devices &middot; {kg_label}</div></center></a>')
+    except Exception:
+        pass
 
     unassigned_count = 0
     if unassigned_site is not None:
@@ -1037,6 +1059,7 @@ footer{{ margin-top:20px; font-family:var(--mono); font-size:11px; color:var(--t
       <a class="btn" href="clients.html">Search Clients</a>
       <a class="btn" href="exports.html">Exports</a>
       <a class="btn" href="configs.html">Configs</a>
+      {kg_button_html}
       <a class="btn" href="site-unassigned.html">Unassigned ({unassigned_count})</a>
       <button class="icon-btn" id="theme-toggle" title="Toggle theme">\U0001F319</button>
     </div>
@@ -1048,6 +1071,7 @@ footer{{ margin-top:20px; font-family:var(--mono); font-size:11px; color:var(--t
     <div class="kpi"><center><div class="num">{total_links}</div><div class="label">Links</div></center></div>
     <div class="kpi"><center><div class="num">{total_clients}</div><div class="label">Clients</div></center></div>
     <div class="kpi"><center>{'<div class="num warn">' if never_scanned > 0 else '<div class="num">'}{never_scanned}</div><div class="label">Never CDP-scanned</div></center></div>
+    {kg_tile_html}
     <a class="kpi kpi-link" href="stale.html" title="Review stale devices"><center><div class="num warn">{stale_device_count}</div><div class="label">Stale devices</div></center></a>
   </div>
 
@@ -2051,6 +2075,9 @@ def generate_all(db_path: str = None):
         print(f"  Wrote {clients_path}")
         stale_path = generate_stale_page(conn)
         print(f"  Wrote {stale_path}")
+        kg_path = kg_pages.generate_kg_page(conn)
+        if kg_path:
+            print(f"  Wrote {kg_path}")
         # Re-derived from every site's own links/tunnel_links each
         # time, same as the index page and client search - not
         # incrementally updatable, so it's always fully regenerated
@@ -2075,6 +2102,9 @@ def generate_one(site_key: str, db_path: str = None):
         print(f"  Wrote {clients_path}")
         stale_path = generate_stale_page(conn)
         print(f"  Wrote {stale_path}")
+        kg_path = kg_pages.generate_kg_page(conn)
+        if kg_path:
+            print(f"  Wrote {kg_path}")
         # This one site's own cross-site links/tunnels can change the
         # all-site map too (a new inter-site edge, a newly-matched
         # tunnel) - regenerated alongside the index for the same

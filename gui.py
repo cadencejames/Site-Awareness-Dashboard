@@ -47,6 +47,7 @@ import credential_store  # noqa: E402
 import credential_loader  # noqa: E402
 import orchestrator  # noqa: E402
 import dashboard_generate  # noqa: E402
+import kg_pages  # noqa: E402
 import config_viewer  # noqa: E402
 import csv_export  # noqa: E402
 import write_queue  # noqa: E402
@@ -1910,6 +1911,9 @@ class DiscoveryTab(ttk.Frame):
                         # "all sites" run.
                         site_map_path = dashboard_generate.generate_site_map(conn)
                         print(f"  Wrote {site_map_path}")
+                        kg_path = kg_pages.generate_kg_page(conn)
+                        if kg_path:
+                            print(f"  Wrote {kg_path}")
                         # Config viewer: this site's device data files
                         # are rebuilt (others untouched); the viewer's
                         # device index is always refreshed.
