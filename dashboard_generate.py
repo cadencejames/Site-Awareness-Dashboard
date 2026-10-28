@@ -1014,9 +1014,9 @@ button, .btn{{ background:var(--panel-2); border:1px solid var(--border); border
 button:hover, .btn:hover{{ border-color:var(--accent); }}
 button:active, .btn:active{{ transform:scale(.97); }}
 .icon-btn{{ width:38px; height:38px; padding:0; display:flex; align-items:center; justify-content:center; font-size:16px; }}
-.kpi-grid{{ display:grid; grid-template-columns:repeat(auto-fill, minmax(175px,1fr)); gap:12px; margin-bottom:24px; }}
-.kpi{{ background:var(--panel); border:1px solid var(--border); border-radius:var(--radius); padding:14px 16px; }}
-.kpi .num{{ font-family:var(--mono); font-size:26px; font-weight:700; }}
+.kpi-grid{{ display:grid; grid-template-columns:repeat(auto-fit, minmax(120px,1fr)); gap:10px; margin-bottom:24px; }}
+.kpi{{ background:var(--panel); border:1px solid var(--border); border-radius:var(--radius); padding:12px 10px; }}
+.kpi .num{{ font-family:var(--mono); font-size:24px; font-weight:700; }}
 .kpi .num.warn{{ color:var(--warn); }}
 .kpi .label{{ font-family:var(--mono); font-size:11px; text-transform:uppercase; letter-spacing:.07em; color:var(--text-dim); margin-top:4px; }}
 .kpi-link{{ display:block; color:inherit; text-decoration:none; transition:border-color .15s ease; }}

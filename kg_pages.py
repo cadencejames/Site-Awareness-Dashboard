@@ -80,7 +80,7 @@ details.kg[open] > summary, details.kg > summary:hover{ background:var(--panel-2
 
 JS = """
 function kgOnlyBad(btn){ var box = btn.closest('.kg-sa'); box.classList.toggle('only-bad'); btn.classList.toggle('on'); }
-function kgShowAll(btn){ btn.closest('.kg-sa').classList.add('show-all'); btn.remove(); }
+function kgShowAll(btn){ btn.closest('.kg-sa').querySelectorAll('.sa-row.extra').forEach(function(r){ r.classList.remove('extra'); }); btn.remove(); }
 function kgOpenFromHash(){
   var h = location.hash; if(h.indexOf('#kg-') !== 0) return;
   var el = document.getElementById(h.slice(1)); if(!el) return;
@@ -344,7 +344,7 @@ def render_kg_fleet_page(conn) -> str:
         if k["last_error"]:
             flags.append("error")
         rows.append(f'''
-      <a class="row kg-row" href="{_site_href(k)}" data-health="{ev['health']}" data-flags="{' '.join(flags)}">
+      <a class="row kg-row" href="{_site_href(k)}" data-health="{ev['health']}" data-flags="{' '.join(flags)}" data-days="{ev['keymat_days'] if ev['keymat_days'] is not None else 999999}" data-batt="{ev['battery_years'] if ev['battery_years'] is not None else -1}" data-name="{_esc(_name(k).lower())}" data-site="{_esc(site.lower())}">
         <span class="kg-dot" style="background:{_DOT[ev['health']]}" title="{_esc(ev['health'])}"></span>
         <div class="main">
           <div class="name">{_esc(_name(k))}</div>
@@ -353,7 +353,7 @@ def render_kg_fleet_page(conn) -> str:
         <div class="kg-col"><div class="kg-lbl">State</div>{_esc(k["state"] or "unknown")}</div>
         <div class="kg-col"><div class="kg-lbl">KEYMAT</div>{km}</div>
         <div class="kg-col"><div class="kg-lbl">Battery age</div>{bt}</div>
-        <div class="kg-col"><div class="kg-lbl">Unreachable</div>{k["assoc_unreachable"]} of {k["assoc_total"]}</div>
+        <div class="kg-col"><div class="kg-lbl">Unreachable</div>{k["assoc_unreachable"]} of {k["assoc_total"]} SAs</div>
         <div class="badges">{''.join(f'<span class="badge reason">{f}</span>' for f in flags)}</div>
       </a>''')
     body = "".join(rows) if rows else '<p class="empty">No KG devices have been imported yet.</p>'
@@ -378,15 +378,15 @@ header h1{{ margin:0; font-size:22px; font-weight:700; }}
 button{{ background:var(--panel-2); border:1px solid var(--border); border-radius:8px; color:var(--text); font-family:var(--sans); font-size:13px; padding:8px 14px; cursor:pointer; }}
 button:hover{{ border-color:var(--accent); }}
 .icon-btn{{ width:38px; height:38px; padding:0; display:flex; align-items:center; justify-content:center; font-size:16px; }}
-.kpi-grid{{ display:grid; grid-template-columns:repeat(auto-fill, minmax(175px,1fr)); gap:12px; margin-bottom:20px; }}
-.kpi{{ background:var(--panel); border:1px solid var(--border); border-radius:var(--radius); padding:14px 16px; text-align:center; }}
+.kpi-grid{{ display:flex; flex-wrap:wrap; justify-content:center; gap:12px; margin-bottom:20px; }}
+.kpi{{ flex:0 1 190px; background:var(--panel); border:1px solid var(--border); border-radius:var(--radius); padding:14px 16px; text-align:center; }}
 .kpi .num{{ font-family:var(--mono); font-size:26px; font-weight:700; }}
 .kpi .num.warn{{ color:var(--warn); }} .kpi .num.amber{{ color:var(--accent); }}
 .kpi .label{{ font-family:var(--mono); font-size:11px; text-transform:uppercase; letter-spacing:.07em; color:var(--text-dim); margin-top:4px; }}
 .controls{{ display:flex; gap:10px; margin-bottom:14px; flex-wrap:wrap; }}
 #search{{ flex:1; min-width:220px; background:var(--panel); border:1px solid var(--border); border-radius:8px; color:var(--text); font-family:var(--mono); font-size:13px; padding:10px 14px; }}
-#health-filter{{ background:var(--panel); border:1px solid var(--border); border-radius:8px; color:var(--text); font-family:var(--mono); font-size:13px; padding:10px 12px; }}
-#search:focus, #health-filter:focus{{ outline:none; border-color:var(--accent); }}
+#sort-by, #health-filter{{ background:var(--panel); border:1px solid var(--border); border-radius:8px; color:var(--text); font-family:var(--mono); font-size:13px; padding:10px 12px; }}
+#search:focus, #sort-by:focus, #health-filter:focus{{ outline:none; border-color:var(--accent); }}
 .note{{ font-family:var(--mono); font-size:11.5px; color:var(--text-dim); margin:0 0 16px; line-height:1.5; }}
 .panel{{ background:var(--panel); border:1px solid var(--border); border-radius:var(--radius); overflow:hidden; margin-bottom:14px; }}
 .row{{ display:flex; align-items:center; gap:14px; padding:10px 14px; border-bottom:1px solid var(--border); text-decoration:none; color:inherit; }}
@@ -427,12 +427,19 @@ footer{{ margin-top:20px; font-family:var(--mono); font-size:11px; color:var(--t
   </div>
 
   <p class="note">
-    Sorted by soonest KEYMAT expiry. Health is worked out from the thresholds in settings.json (state, KEYMAT expiry,
+    Starts sorted by soonest KEYMAT expiry; use the sort menu to change it. Health is worked out from the thresholds in settings.json (state, KEYMAT expiry,
     battery age, interface status). Click a row to open that KG on its site page. {_esc(note or '')}
   </p>
 
   <div class="controls">
     <input id="search" type="text" placeholder="Filter by name, serial, site, state…" autocomplete="off">
+    <select id="sort-by" title="Sort order">
+      <option value="keymat">Sort: soonest KEYMAT</option>
+      <option value="health">Sort: worst health first</option>
+      <option value="battery">Sort: oldest battery</option>
+      <option value="name">Sort: name</option>
+      <option value="site">Sort: site</option>
+    </select>
     <select id="health-filter">
       <option value="">All health levels</option>
       <option value="critical">Critical</option>
@@ -457,6 +464,21 @@ function applyFilters(){{
     row.style.display = (okH && okT) ? "" : "none";
   }});
 }}
+const RANK = {{critical:3, warning:2, unknown:1, ok:0}};
+function num(r, k){{ return parseFloat(r.dataset[k]); }}
+function byName(a, b){{ return a.dataset.name < b.dataset.name ? -1 : a.dataset.name > b.dataset.name ? 1 : 0; }}
+const SORTS = {{
+  keymat:  (a, b) => num(a, "days") - num(b, "days") || byName(a, b),
+  health:  (a, b) => RANK[b.dataset.health] - RANK[a.dataset.health] || num(a, "days") - num(b, "days") || byName(a, b),
+  battery: (a, b) => num(b, "batt") - num(a, "batt") || byName(a, b),
+  name:    byName,
+  site:    (a, b) => (a.dataset.site < b.dataset.site ? -1 : a.dataset.site > b.dataset.site ? 1 : 0) || byName(a, b),
+}};
+function applySort(){{
+  const box = document.getElementById("rows");
+  Array.from(box.querySelectorAll(".kg-row")).sort(SORTS[document.getElementById("sort-by").value]).forEach(r => box.appendChild(r));
+}}
+document.getElementById("sort-by").addEventListener("change", applySort);
 document.getElementById("search").addEventListener("input", applyFilters);
 document.getElementById("health-filter").addEventListener("change", applyFilters);
 {dg.THEME_TOGGLE_JS}
