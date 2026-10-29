@@ -6,3 +6,4 @@ session_logs/
 dashboard/
 __pycache__/
 *.pyc
+.vscode

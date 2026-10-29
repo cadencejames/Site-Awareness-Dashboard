@@ -48,6 +48,7 @@ import credential_loader  # noqa: E402
 import orchestrator  # noqa: E402
 import dashboard_generate  # noqa: E402
 import kg_pages  # noqa: E402
+import gemone_tab  # noqa: E402
 import config_viewer  # noqa: E402
 import csv_export  # noqa: E402
 import write_queue  # noqa: E402
@@ -2782,6 +2783,7 @@ class App(tk.Tk):
         notebook.add(DiscoveryTab(notebook, self.creds), text="Discovery")
         notebook.add(ExportTab(notebook), text="Export")
         notebook.add(CommandRunnerTab(notebook, self.creds), text="Command Runner")
+        notebook.add(gemone_tab.GemOneTab(notebook, self.creds), text="GEM One")
         notebook.add(CredentialsTab(notebook, login_path, self.creds, master_password), text="Credentials")
 
         # Keeps the shared write queue moving even when this GUI is
