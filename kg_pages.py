@@ -209,12 +209,12 @@ def _iface_card(title, ip, mac, status) -> str:
             f'{"Interface " + _esc(status) if status else "Interface status unknown"}</div></div>')
 
 
-def _if_cell(status) -> str:
-    """A dot plus the interface status text, for the fleet page."""
+def _if_cell(ip, status) -> str:
+    """The interface IP, with a dot showing its status (hover for the text), for the fleet page."""
     up = (status or "").strip().lower()
     color = "var(--up)" if up == "up" else "var(--warn)" if up == "down" else "var(--text-dim)"
-    return (f'<span class="kg-dot" style="background:{color};width:8px;height:8px"></span> '
-            f'{_esc(status) if status else "unknown"}')
+    return (f'<span class="kg-dot" style="background:{color};width:8px;height:8px" title="Interface {_esc(status) if status else "status unknown"}"></span> '
+            f'<span class="kg-mono">{_esc(ip) if ip else "-"}</span>')
 
 
 def _reachable_counts(conn) -> dict:
@@ -371,8 +371,9 @@ def render_kg_fleet_page(conn) -> str:
           <div class="name">{_esc(_name(k))}</div>
           <div class="meta">{_esc(site)} &middot; {_esc(k["device_type"] or "-")} &middot; {_esc(k["serial_number"])}</div>
         </div>
-        <div class="kg-col"><div class="kg-lbl">PT interface</div>{_if_cell(k["pt_status"])}</div>
-        <div class="kg-col"><div class="kg-lbl">CT interface</div>{_if_cell(k["ct_status"])}</div>
+        <div class="kg-col"><div class="kg-lbl">PT IP</div>{_if_cell(k["pt_ip"], k["pt_status"])}</div>
+        <div class="kg-col"><div class="kg-lbl">CT IP</div>{_if_cell(k["ct_ip"], k["ct_status"])}</div>
+        <div class="kg-col"><div class="kg-lbl">Software</div><span class="kg-mono">{_esc(k["software_version"] or "-")}</span></div>
         <div class="kg-col"><div class="kg-lbl">KEYMAT</div>{km}</div>
         <div class="kg-col"><div class="kg-lbl">Battery age</div>{bt}</div>
         <div class="kg-col"><div class="kg-lbl">Reachable</div>{sa_cell}</div>
