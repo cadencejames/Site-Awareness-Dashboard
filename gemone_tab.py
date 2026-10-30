@@ -225,6 +225,8 @@ class GemOneTab(ttk.Frame):
         bar.grid(row=0, column=0, sticky="ew")
         self.assign_button = ttk.Button(bar, text="Assign selected to site...", command=self._on_assign, state="disabled")
         self.assign_button.pack(side="left")
+        self.remove_button = ttk.Button(bar, text="Remove selected...", command=self._on_remove, state="disabled")
+        self.remove_button.pack(side="left", padx=(6, 0))
         ttk.Button(bar, text="Load site map CSV...", command=self._on_load_map).pack(side="left", padx=(6, 0))
         ttk.Button(bar, text="Refresh", command=self.refresh_kgs).pack(side="left", padx=(6, 0))
         self.kg_count_label = ttk.Label(bar, text="")
@@ -234,10 +236,11 @@ class GemOneTab(ttk.Frame):
         frame.grid(row=1, column=0, sticky="nsew")
         frame.rowconfigure(0, weight=1)
         frame.columnconfigure(0, weight=1)
-        cols = ("name", "serial", "site", "state", "keymat", "health")
+        cols = ("name", "serial", "site", "state", "keymat", "health", "note")
         self.kg_tree = ttk.Treeview(frame, columns=cols, show="headings", selectmode="extended")
         for col, text, width in (("name", "Name", 170), ("serial", "Serial", 130), ("site", "Site", 150),
-                                 ("state", "State", 110), ("keymat", "KEYMAT", 110), ("health", "Health", 80)):
+                                 ("state", "State", 110), ("keymat", "KEYMAT", 110), ("health", "Health", 80),
+                                 ("note", "Note", 150)):
             self.kg_tree.heading(col, text=text)
             self.kg_tree.column(col, width=width, anchor="w")
         self.kg_tree.grid(row=0, column=0, sticky="nsew")
@@ -247,8 +250,7 @@ class GemOneTab(ttk.Frame):
         for name, color in HEALTH_COLORS.items():
             self.kg_tree.tag_configure(name, foreground=color)
         self.kg_tree.bind("<<TreeviewSelect>>",
-                          lambda e: self.assign_button.configure(
-                              state="normal" if self.kg_tree.selection() and not self._is_busy() else "disabled"))
+                          self._on_kg_selection)
 
     # ------------------------------------------------------------------
     # small helpers
@@ -291,6 +293,7 @@ class GemOneTab(ttk.Frame):
         self.cancel_button.configure(state="normal" if busy else "disabled")
         if busy:
             self.assign_button.configure(state="disabled")
+            self.remove_button.configure(state="disabled")
 
     def _clear_log(self):
         self.log.configure(state="normal")
@@ -570,13 +573,43 @@ class GemOneTab(ttk.Frame):
                 site_text = f"{site}  -  {k['site_name']}" if k["site_name"] else site
             days = ev["keymat_days"]
             keymat = "-" if days is None else ("expired" if days < 0 else f"{days} days")
+            note = "not in latest file" if k["missing_since"] else ("last pull failed" if k["last_error"] else "")
             self.kg_tree.insert("", "end", iid=k["serial_number"], tags=(ev["health"],), values=(
-                k["system_name"] or "-", k["serial_number"], site_text, k["state"] or "unknown", keymat, ev["health"]))
+                k["system_name"] or "-", k["serial_number"], site_text, k["state"] or "unknown", keymat, ev["health"], note))
             self._kg_rows[k["serial_number"]] = k
         text = f"{len(rows)} KG(s)"
         if unassigned:
             text += f", {unassigned} with no site"
         self.kg_count_label.configure(text=text)
+
+    def _on_kg_selection(self, event=None):
+        state = "normal" if self.kg_tree.selection() and not self._is_busy() else "disabled"
+        self.assign_button.configure(state=state)
+        self.remove_button.configure(state=state)
+
+    def _on_remove(self):
+        serials = list(self.kg_tree.selection())
+        if not serials or self._is_busy():
+            return
+        names = "\n".join(f"  {self._kg_rows[s]['system_name'] or '-'}  ({s})" for s in serials[:10])
+        if len(serials) > 10:
+            names += f"\n  ... and {len(serials) - 10} more"
+        if not messagebox.askyesno(
+                "Remove KGs",
+                f"Remove {len(serials)} KG(s) from SAD?\n\n{names}\n\n"
+                "They disappear from the dashboard. If a later GEM One file lists one again, it comes back by itself."):
+            return
+        failed = []
+        for serial in serials:
+            try:
+                write_queue.queue_and_wait("soft_delete_kg_device", timeout=30, serial_number=serial)
+            except (RuntimeError, TimeoutError) as e:
+                failed.append(f"{serial}: {e}")
+        self.refresh_kgs()
+        if failed:
+            messagebox.showerror("Remove KGs", "Some removals failed:\n\n" + "\n".join(failed[:10]))
+        else:
+            messagebox.showinfo("Remove KGs", "Removed. Regenerate the dashboard to update the pages.")
 
     def _on_assign(self):
         serials = list(self.kg_tree.selection())

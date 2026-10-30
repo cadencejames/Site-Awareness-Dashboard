@@ -209,6 +209,20 @@ def _iface_card(title, ip, mac, status) -> str:
             f'{"Interface " + _esc(status) if status else "Interface status unknown"}</div></div>')
 
 
+def _if_cell(status) -> str:
+    """A dot plus the interface status text, for the fleet page."""
+    up = (status or "").strip().lower()
+    color = "var(--up)" if up == "up" else "var(--warn)" if up == "down" else "var(--text-dim)"
+    return (f'<span class="kg-dot" style="background:{color};width:8px;height:8px"></span> '
+            f'{_esc(status) if status else "unknown"}')
+
+
+def _reachable_counts(conn) -> dict:
+    """{kg_id: number of security associations whose pair is reachable}."""
+    return {r[0]: r[1] for r in conn.execute(
+        "SELECT kg_id, COUNT(*) FROM kg_security_associations WHERE pair_reachable = 1 GROUP BY kg_id")}
+
+
 def _peers(all_kgs) -> dict:
     peers = {}
     for k in all_kgs:
@@ -257,8 +271,8 @@ def _device_block(conn, k, cfg, peers) -> str:
       <div class="kg-body">
         <div class="kg-why">{_esc(why)}</div>
         <div class="kg-cards">
-          {_iface_card("Plaintext side", k["pt_ip"], k["pt_mac"], k["pt_status"])}
-          {_iface_card("Ciphertext side", k["ct_ip"], k["ct_mac"], k["ct_status"])}
+          {_iface_card("PT Interface", k["pt_ip"], k["pt_mac"], k["pt_status"])}
+          {_iface_card("CT Interface", k["ct_ip"], k["ct_mac"], k["ct_status"])}
           <div class="kg-card"><div class="t">Software</div><div class="v">{_esc(k["software_version"] or "-")}</div><div class="s">{_esc(k["device_type"] or "")}</div></div>
           <div class="kg-card"><div class="t">GEM One data</div><div class="v">{_fmt_ts(k["data_collected_at"])}</div><div class="s">first seen {_fmt_ts(k["first_seen"])}</div></div>
         </div>
@@ -325,6 +339,7 @@ def summary(conn) -> dict:
 def render_kg_fleet_page(conn) -> str:
     import dashboard_generate as dg   # shared theme tokens and helpers; imported late to avoid a circular import
     kgs, cfg, today, note = _load(conn)
+    reachable = _reachable_counts(conn)
     c = _counts(kgs)
     warn_days = cfg.get("keymat_warn_days") or 0
     expiring = sum(1 for k in kgs if k["ev"]["keymat_days"] is not None and k["ev"]["keymat_days"] <= warn_days)
@@ -338,22 +353,29 @@ def render_kg_fleet_page(conn) -> str:
         km = (f'<span class="kg-mono">{_esc(k["ffvs_exp_date"])}</span> <span class="{_TXT[ev["keymat_health"]]}">&middot; {_days_text(ev["keymat_days"])}</span>'
               if k["ffvs_exp_date"] else '<span class="kg-c-dim">no KEYMAT date</span>')
         bt = (f'<span class="kg-mono">{ev["battery_years"]} yr</span>' if k["battery_change_date"] else '<span class="kg-c-dim">-</span>')
+        total_sa = k["assoc_total"]
+        ok_sa = reachable.get(k["id"], 0)
+        if not total_sa:
+            sa_cell = '<span class="kg-c-dim">no SAs</span>'
+        else:
+            sa_cell = f'<span class="{"kg-c-warn" if k["assoc_unreachable"] else ""}">{ok_sa} of {total_sa} SAs</span>'
         flags = []
         if k["missing_since"]:
             flags.append("missing")
         if k["last_error"]:
             flags.append("error")
         rows.append(f'''
-      <a class="row kg-row" href="{_site_href(k)}" data-health="{ev['health']}" data-flags="{' '.join(flags)}" data-days="{ev['keymat_days'] if ev['keymat_days'] is not None else 999999}" data-batt="{ev['battery_years'] if ev['battery_years'] is not None else -1}" data-name="{_esc(_name(k).lower())}" data-site="{_esc(site.lower())}">
+      <a class="row kg-row" href="{_site_href(k)}" data-health="{ev['health']}" data-flags="{' '.join(flags)}" data-state="{_esc((k['state'] or '').lower())}" data-days="{ev['keymat_days'] if ev['keymat_days'] is not None else 999999}" data-batt="{ev['battery_years'] if ev['battery_years'] is not None else -1}" data-name="{_esc(_name(k).lower())}" data-site="{_esc(site.lower())}">
         <span class="kg-dot" style="background:{_DOT[ev['health']]}" title="{_esc(ev['health'])}"></span>
         <div class="main">
           <div class="name">{_esc(_name(k))}</div>
           <div class="meta">{_esc(site)} &middot; {_esc(k["device_type"] or "-")} &middot; {_esc(k["serial_number"])}</div>
         </div>
-        <div class="kg-col"><div class="kg-lbl">State</div>{_esc(k["state"] or "unknown")}</div>
+        <div class="kg-col"><div class="kg-lbl">PT interface</div>{_if_cell(k["pt_status"])}</div>
+        <div class="kg-col"><div class="kg-lbl">CT interface</div>{_if_cell(k["ct_status"])}</div>
         <div class="kg-col"><div class="kg-lbl">KEYMAT</div>{km}</div>
         <div class="kg-col"><div class="kg-lbl">Battery age</div>{bt}</div>
-        <div class="kg-col"><div class="kg-lbl">Unreachable</div>{k["assoc_unreachable"]} of {k["assoc_total"]} SAs</div>
+        <div class="kg-col"><div class="kg-lbl">Reachable</div>{sa_cell}</div>
         <div class="badges">{''.join(f'<span class="badge reason">{f}</span>' for f in flags)}</div>
       </a>''')
     body = "".join(rows) if rows else '<p class="empty">No KG devices have been imported yet.</p>'
@@ -460,7 +482,7 @@ function applyFilters(){{
   const h = document.getElementById("health-filter").value;
   document.querySelectorAll("#rows .kg-row").forEach(row => {{
     const okH = !h || (h === "flagged" ? row.dataset.flags !== "" : row.dataset.health === h);
-    const okT = !f || row.textContent.toLowerCase().includes(f);
+    const okT = !f || (row.textContent + " " + (row.dataset.state || "")).toLowerCase().includes(f);
     row.style.display = (okH && okT) ? "" : "none";
   }});
 }}
