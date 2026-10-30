@@ -23,7 +23,7 @@ found, that's the real device, and the foreign one is merged into it:
   - the now-childless duplicate device row is deleted
 
 Usage (run from the project root):
-    python3 utilities/merge_duplicate_devices.py
+    python3 utilities/maintenance/merge_duplicate_devices.py
 
 Only merges cases where exactly one real device is found anywhere else
 in the database - zero matches (a genuinely new device, nothing to
@@ -37,8 +37,11 @@ being merged were already confirmed as genuine duplicates via SQL
 before this was built - back up sad.db first if you want extra safety.
 """
 
-import db
+import os
+import sys
 
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
+import db # noqa: E402
 
 def merge_duplicate(conn, duplicate_id: int, real_id: int, hostname: str) -> None:
     for row in db.get_device_ip_rows(conn, duplicate_id):

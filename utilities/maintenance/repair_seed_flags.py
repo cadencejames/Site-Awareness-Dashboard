@@ -12,14 +12,18 @@ already has the right hostname, we just need to flip the matching
 device's flag.
 
 Usage (run from the project root):
-    python3 utilities/repair_seed_flags.py
+    python3 utilities/maintenance/repair_seed_flags.py
 
 Safe to re-run - it's idempotent (uses set_device_as_seed(), the same
 function normal seed-flagging uses, just driven from the existing
 seed_device values instead of manual input).
 """
 
-import db
+import os
+import sys
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
+import db # noqa: E402
 
 
 def repair(db_path: str = db.DB_PATH) -> None:

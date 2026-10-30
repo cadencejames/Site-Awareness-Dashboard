@@ -10,7 +10,7 @@ the current hostname-first rule, and moves it to its correct site (or
 Unassigned) if that differs from where it's currently filed.
 
 Usage (run from the project root):
-    python3 utilities/repair_cross_site_links.py
+    python3 utilities/maintenance/repair_cross_site_links.py
 
 Safe to re-run - devices already correctly attributed are left alone.
 
@@ -25,7 +25,11 @@ them by hand.
 
 import sqlite3
 
-import db
+import os
+import sys
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
+import db # noqa: E402
 
 
 def repair(db_path: str = db.DB_PATH) -> None:

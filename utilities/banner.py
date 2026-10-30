@@ -1,6 +1,6 @@
 """Classification banner for the SAD static pages (dashboard and config viewer).
 
-No dependencies beyond the standard library. See BANNER.md for how it is
+No dependencies beyond the standard library. See docs/BANNER.md for how it is
 wired into SAD and how to change the text or colors.
 
 The text and any extra colors come from settings.json in the project root

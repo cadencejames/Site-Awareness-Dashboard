@@ -19,15 +19,15 @@ first) is kept; the other is deleted. Nothing else in the database is
 touched - no devices, no other links, no ARP data.
 
 Usage (run from the project root):
-    python3 utilities/repair_duplicate_links.py         # preview only, no changes made
-    python3 utilities/repair_duplicate_links.py --apply  # actually delete the duplicates
+    python3 utilities/maintenance/repair_duplicate_links.py         # preview only, no changes made
+    python3 utilities/maintenance/repair_duplicate_links.py --apply  # actually delete the duplicates
 """
 
 import sys
 import os
 import argparse
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 import db  # noqa: E402
 
 

@@ -49,7 +49,7 @@ view it.
   Only the Topology section is open by default on a site page.
 - **Classification banner** - a configurable banner across the top of
   every page and the config viewer, set from `settings.json`
-  (see `BANNER.md`).
+  (see `docs/BANNER.md`).
 - **CSV exports** - phone/VTC and full device inventories, regenerated
   on demand.
 - **Command Runner** - a small plugin system for making changes across
@@ -98,7 +98,7 @@ devices and (optionally) CUCM and GEM One.
 5. Generate the dashboard - `gui.py`'s toolbar or
    `python3 dashboard_generate.py`.
 
-See `ONBOARDING.md` for the full walkthrough, a tour of every tab, and
+See `docs/ONBOARDING.md` for the full walkthrough, a tour of every tab, and
 a set of gotchas worth knowing before you dig in (particularly around
 the credential store's field-naming, which has a real gotcha in how
 you add credential types).
@@ -144,12 +144,10 @@ kg_pages.py              KG panel on site pages and the kg.html fleet page
 config_viewer.py         builds the configs.html viewer
 config_viewer_template.html
 gemone_import.py         checks and imports the GEM One JSON file
-clean_old_snapshots.py   re-cleans stored config snapshots (dry run by default)
 settings.json            classification banner and GEM One settings
-
+docs/                    ONBOARDING.md, BANNER.md, GEM One script requirements
 gemone/                  your GEM One script, its output.json, kg_site_map.csv
 credentials/             encrypted credential stores, one per user (never commit these)
-
 utilities/
   db.py                    schema and all database access
   write_queue.py           durable write queue
@@ -164,6 +162,9 @@ utilities/
   csv_export.py / cucm_enrich.py
   topology_layout.py / topology_svg.py
   verify_scan.py           post-scan sanity report
+  maintenance/             one-time repair and diagnostic tools, run from the project root
+                           (repair_*, merge_duplicate_devices, fix_bad_platforms,
+                           clean_old_snapshots, stale_check)
   plugins/                 Command Runner plugins
 ```
 
@@ -173,7 +174,7 @@ Actively developed against a real production environment - built and
 refined feature by feature (topology discovery, staleness tracking,
 client/phone/VTC tracking, CUCM enrichment, CSV export, credential
 management, multi-user write handling, config snapshots, GEM One KG
-tracking) rather than designed all at once. `ONBOARDING.md` tracks the
+tracking) rather than designed all at once. `docs/ONBOARDING.md` tracks the
 open/known-gap items still on the list.
 
 ## Disclaimer

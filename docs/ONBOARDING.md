@@ -15,9 +15,9 @@ quietly points at (or creates) the wrong database file.
 ## Project layout
 
 ```
-sad.db                 the whole database - one file, SQLite
-credentials.enc         your encrypted credential store (created on first launch)
-write_queue/            spool directory the write queue uses - see "The write queue" below
+sad.db                   the whole database - one file, SQLite
+credentials/             your encrypted credential store is located here (created on first launch)
+write_queue/             spool directory the write queue uses - see "The write queue" below
 dashboard/               generated HTML output (gitignore-worthy, regenerated on demand)
 logs/                    Command Runner's per-run audit logs
 session_logs/            raw Netmiko session logs, only when explicitly enabled for troubleshooting
@@ -41,8 +41,9 @@ utilities/                shared library code, plus every CLI maintenance tool
   verify_scan.py           post-scan sanity report - a testing tool, see "Tools you probably won't need day-to-day" below
   test_cdp_live.py / test_arp_live.py   standalone live-gear parser tests, don't touch the database
   topology_layout.py / topology_svg.py   the per-site topology diagram (layout math, then SVG rendering)
-  merge_duplicate_devices.py / repair_cross_site_links.py / repair_duplicate_links.py /
-  repair_seed_flags.py / fix_bad_platforms.py   one-time/as-needed data-repair tools
+  maintenance/             one-time/as-needed data-repair and diagnostic tools, run from the project root:
+                           merge_duplicate_devices.py / repair_cross_site_links.py / repair_duplicate_links.py /
+                           repair_seed_flags.py / fix_bad_platforms.py / clean_old_snapshots.py / stale_check.py
   plugins/                 Command Runner plugins (see "Command Runner" below)
 ```
 
@@ -368,8 +369,9 @@ is which one wins the ranking, not how many rows exist.
 
 ## Tools you probably won't need day-to-day
 
-These live in `utilities/` and are useful to know about, but nothing
-in normal day-to-day use requires them:
+These live in `utilities/` (the repair and diagnostic ones in
+`utilities/maintenance/`) and are useful to know about, but nothing
+in normal day-to-day use requires them. Run them from the project root:
 
 - **`verify_scan.py`** — a post-scan sanity report: per-site counts of
   devices/links/clients/ARP entries, flags for sites that look
@@ -381,9 +383,22 @@ in normal day-to-day use requires them:
   parsed VRF/ARP data to the console, without touching the database.
   For checking a parser against real gear before trusting a live scan
   with it.
-- **`merge_duplicate_devices.py` / `repair_cross_site_links.py` /
-  `repair_duplicate_links.py` / `repair_seed_flags.py` /
-  `fix_bad_platforms.py`** — one-time or as-needed data-repair tools
-  for specific known-drift scenarios. Each has its own docstring
+- **`maintenance/merge_duplicate_devices.py` /
+  `maintenance/repair_cross_site_links.py` /
+  `maintenance/repair_duplicate_links.py` /
+  `maintenance/repair_seed_flags.py` /
+  `maintenance/fix_bad_platforms.py`** - one-time or as-needed data-repair
+  tools for specific known-drift scenarios. Each has its own docstring
   explaining exactly what it fixes and when you'd need it; not
-  something to run speculatively.
+  something to run speculatively. Run them as, for example,
+  `python3 utilities/maintenance/repair_seed_flags.py`.
+- **`maintenance/stale_check.py`** - read-only. Prints every device the
+  dashboard counts as stale, per site, with the reason, so you can
+  compare it against the dashboard and the Site Manager list. Run with
+  `python3 utilities/maintenance/stale_check.py`, optionally followed by
+  a site octet.
+- **`maintenance/clean_old_snapshots.py`** - one-time cleanup that
+  re-cleans config snapshots stored before the parser dropped volatile
+  lines (like the NVRAM "last updated" notice). It's a dry run unless
+  you pass `--apply`, and `--apply` backs up `sad.db` first. Run with
+  `python3 utilities/maintenance/clean_old_snapshots.py`.

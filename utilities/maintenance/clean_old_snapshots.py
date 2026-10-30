@@ -1,18 +1,19 @@
 """One-time cleanup: re-clean stored config snapshots saved before the
 parser learned to drop the '! NVRAM config last updated...' line.
 
-  python clean_old_snapshots.py                 dry run (changes nothing)
-  python clean_old_snapshots.py --apply         back up sad.db, then write
-  python clean_old_snapshots.py --apply --collapse
-                                                also delete a snapshot that
-                                                becomes identical to the one
-                                                before it (never the baseline)
-  python clean_old_snapshots.py --db path\\to\\sad.db
+  python utilities/maintenance/clean_old_snapshots.py                   dry run (changes nothing)
+  python utilities/maintenance/clean_old_snapshots.py --apply           back up sad.db, then write
+  python utilities/maintenance/clean_old_snapshots.py --apply --collapse
+                                                                        also delete a snapshot that
+                                                                        becomes identical to the one
+                                                                        before it (never the baseline)
+  python utilities/maintenance/clean_old_snapshots.py --db path\\to\\sad.db
 
-Run it from the folder that holds sad.db (or pass --db)."""
+Run it from the project root (or pass --db)."""
 import argparse, hashlib, os, shutil, sqlite3, sys, time, zlib
 
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "utilities"))
+_HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, os.path.join(_HERE, ".."))         # utilities/
 import config_parser
 
 

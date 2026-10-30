@@ -14,7 +14,7 @@ Add new known-bad values to BAD_PLATFORM_VALUES as you find them -
 same pattern as cdp_parser.py's IGNORE_HOSTNAME_PATTERNS.
 
 Usage (run from the project root):
-    python3 utilities/fix_bad_platforms.py
+    python3 utilities/maintenance/fix_bad_platforms.py
 
 For each affected device, shows its hostname/site/current platform
 and prompts for the correct value. Correcting it tags the device
@@ -24,7 +24,11 @@ correction is protected from being silently overwritten the next time
 inventory_import.py runs, unlike a raw SQL UPDATE would be.
 """
 
-import db
+import os
+import sys
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
+import db # noqa: E402
 
 # Add more values here as you find them.
 BAD_PLATFORM_VALUES = [

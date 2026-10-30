@@ -1,13 +1,15 @@
 """stale_check.py - read-only. Prints every device the dashboard's rule
 calls stale, per site, with the reason, so it can be compared against
 the dashboard page and the Site Manager list. Usage:
-    python stale_check.py            (all sites)
-    python stale_check.py 10.1.1     (one site octet)
+    python utilities/maintenance/stale_check.py            (all sites)
+    python utilities/maintenance/stale_check.py 10.1.1     (one site octet)
 """
 import os
 import sys
 
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "utilities"))
+_HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, os.path.join(_HERE, ".."))         # utilities/
+sys.path.insert(0, os.path.join(_HERE, "..", ".."))   # project root, for dashboard_generate
 import db
 import dashboard_generate as dg
 
