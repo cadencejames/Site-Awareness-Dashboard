@@ -150,10 +150,7 @@ def unlock_store() -> tuple[str, dict]:
                     f"(R)etry the password, or create a (N)ew personal store? "
                 ).strip().lower()
                 if choice == "n":
-                    try:
-                        CREDENTIALS_FILE = f"credentials_{getpass.getuser()}.enc"
-                    except Exception:
-                        CREDENTIALS_FILE = credential_store.DEFAULT_CREDENTIALS_FILE
+                    CREDENTIALS_FILE = credential_store.personal_credentials_path()
                     return initialize_store()
 
 

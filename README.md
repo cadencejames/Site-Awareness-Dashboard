@@ -8,10 +8,11 @@ Catalyst Center isn't an option.
 
 SAD connects to your Cisco gear over SSH (via Netmiko), walks CDP to
 discover devices and links site by site, pulls ARP tables and MAC
-address tables, correlates phone/VTC clients through CUCM/RIS, and
-generates a set of static HTML pages you can open in any browser - no
-server, no database engine beyond a local SQLite file, no internet
-access required to run or view it.
+address tables, correlates phone/VTC clients through CUCM/RIS, tracks
+KG (TACLANE) health from GEM One, and generates a set of static HTML
+pages you can open in any browser - no server, no database engine
+beyond a local SQLite file, no internet access required to run or
+view it.
 
 ## What it does
 
@@ -25,15 +26,30 @@ access required to run or view it.
 - **MAC address table collection** (opt-in) - correlates switch
   MAC tables against CDP-known links to distinguish real end-host
   clients from inter-switch uplinks.
+- **Tunnel collection** (opt-in) - tunnel interfaces and the links
+  between them, shown per site and on the cross-site map.
 - **Phone/VTC identification and enrichment** - detects Cisco IP
   phones and VTC units (Webex Room/Desk devices, TelePresence) via
   their CDP-reported platform string, then optionally enriches them
   with CUCM/RIS data (registration status, extension, serial number).
-- **Static HTML dashboard** - a dark, network-ops-styled set of pages:
-  a cross-site index, one page per site with device/link/ARP/client
-  tables and an auto-laid-out topology diagram, and a cross-site
-  client search page. Everything is generated once and works as plain
+- **Device configuration snapshots and viewer** - pulls running
+  configs, strips volatile lines (timestamps, NVRAM notices) so only
+  real changes show up, and keeps a history per device. `configs.html`
+  is a static viewer with a side-by-side diff between any two
+  snapshots, a section tree, and a snapshot picker. Devices with
+  stored configs get a `config` badge on their site page.
+- **GEM One KG (TACLANE) tracking** - see the section below.
+- **Static HTML dashboard** - a dark, network-ops-styled set of pages
+  (with a light theme toggle): a cross-site index, one page per site
+  with collapsible device/link/ARP/tunnel/client/KG sections and an
+  auto-laid-out topology diagram, a cross-site site map, a client
+  search page, a stale-devices review page, a configs viewer, and a
+  KG fleet page. Everything is generated once and works as plain
   files - open `dashboard/index.html` in a browser, no server needed.
+  Only the Topology section is open by default on a site page.
+- **Classification banner** - a configurable banner across the top of
+  every page and the config viewer, set from `settings.json`
+  (see `BANNER.md`).
 - **CSV exports** - phone/VTC and full device inventories, regenerated
   on demand.
 - **Command Runner** - a small plugin system for making changes across
@@ -64,7 +80,7 @@ pip install netmiko cryptography requests
 
 Everything else is Python standard library - no web framework, no
 JavaScript build step, no external services beyond your own Cisco
-devices and (optionally) CUCM.
+devices and (optionally) CUCM and GEM One.
 
 ## Getting started
 
@@ -87,18 +103,61 @@ a set of gotchas worth knowing before you dig in (particularly around
 the credential store's field-naming, which has a real gotcha in how
 you add credential types).
 
+## GEM One KG (TACLANE) tracking
+
+SAD tracks KG health, KEYMAT expiry, battery age, interface status and
+security associations. It never talks to GEM One itself: your own
+script (`gemone/gemone_full_pull.py`, see `GEMONE_SCRIPT_REQUIREMENTS.md`)
+writes a JSON file, and SAD imports it.
+
+**Setup:** add a `gemone` entry with `username` and `password` fields
+on the Credentials tab, check the `gemone` section of `settings.json`
+(script path, output file, health thresholds), and optionally map KG
+serials to sites in `gemone/kg_site_map.csv` (`serial,site`). Unmapped
+KGs land in Unassigned.
+
+**Use:** the GUI's **GEM One** tab pulls, checks and imports in one
+step (tick *Dry run* to preview), assigns KGs to sites, and removes
+KGs that no longer exist. From the command line:
+
+```
+python gemone_import.py                  preview an import
+python gemone_import.py --apply          import
+python gemone_import.py --map --apply    load the serial-to-site CSV
+python gemone_import.py --list           list KGs with their health
+```
+
+Health is worked out when the pages are built, so changing a threshold
+in `settings.json` only needs a dashboard rebuild. Results appear in a
+collapsed KG section on each site page and on `kg.html`. A KG missing
+from a newer file stays on the dashboard, marked "not in latest file",
+until you remove it.
+
 ## Project layout
 
 ```
 gui.py                   desktop app - day-to-day tool
+gemone_tab.py            the GEM One tab for gui.py
 orchestrator.py          CDP/ARP/MAC-table discovery engine
 dashboard_generate.py    builds the static HTML dashboard
+kg_pages.py              KG panel on site pages and the kg.html fleet page
+config_viewer.py         builds the configs.html viewer
+config_viewer_template.html
+gemone_import.py         checks and imports the GEM One JSON file
+clean_old_snapshots.py   re-cleans stored config snapshots (dry run by default)
+settings.json            classification banner and GEM One settings
+
+gemone/                  your GEM One script, its output.json, kg_site_map.csv
 
 utilities/
   db.py                    schema and all database access
   write_queue.py           durable write queue
   credential_store.py / credential_manager.py / credential_loader.py
   cdp_parser.py / arp_parser.py / vrf_parser.py / mac_parser.py
+  config_parser.py         cleans and sections device configs
+  kg_health.py             KG health rules
+  settings_loader.py       reads settings.json
+  banner.py                classification banner
   inventory_import.py / site_identity_import.py / subnet_override_import.py
   site_manager.py          interactive per-site setup
   csv_export.py / cucm_enrich.py
@@ -112,9 +171,9 @@ utilities/
 Actively developed against a real production environment - built and
 refined feature by feature (topology discovery, staleness tracking,
 client/phone/VTC tracking, CUCM enrichment, CSV export, credential
-management, multi-user write handling) rather than designed all at
-once. `ONBOARDING.md` tracks the open/known-gap items still on the
-list.
+management, multi-user write handling, config snapshots, GEM One KG
+tracking) rather than designed all at once. `ONBOARDING.md` tracks the
+open/known-gap items still on the list.
 
 ## Disclaimer
 

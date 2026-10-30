@@ -9,6 +9,10 @@ from here rather than keeping their own copies - a single shared
 implementation means there's nothing to drift out of sync between the
 places that write the store and the places that read it.
 
+Store files live in the "credentials" folder (CREDENTIALS_DIR) under the
+project root, one per OS user (credentials_<username>.enc). Files left in
+the project root by earlier versions are still found and used in place.
+
 File format written to disk (e.g. credentials.enc):
     [ SALT_SIZE bytes salt ][ NONCE_SIZE bytes nonce ][ AES-GCM ciphertext ]
 """
@@ -25,6 +29,19 @@ from cryptography.exceptions import InvalidTag  # re-exported for callers
 BACKEND = default_backend()
 
 DEFAULT_CREDENTIALS_FILE = "credentials.enc"
+CREDENTIALS_DIR = "credentials"
+
+
+def personal_credentials_path(base_dir: str = ".") -> str:
+    """Where a NEW store for the current OS user goes: inside
+    CREDENTIALS_DIR, as credentials_<username>.enc (or the original fixed
+    name if the username can't be determined). Doesn't check whether the
+    file exists."""
+    folder = os.path.join(base_dir, CREDENTIALS_DIR)
+    try:
+        return os.path.join(folder, f"credentials_{getpass.getuser()}.enc")
+    except Exception:
+        return os.path.join(folder, DEFAULT_CREDENTIALS_FILE)
 
 
 def resolve_credentials_path(base_dir: str = ".") -> str:
@@ -33,35 +50,38 @@ def resolve_credentials_path(base_dir: str = ".") -> str:
     their own separate, independently-password-protected file rather
     than one shared file (and one shared master password) for everyone.
 
-    Resolution order:
-      1. credentials_<username>.enc, if it already exists - this
-         person already has their own store.
-      2. The original credentials.enc, if it exists and this person
-         has no per-user file yet - preserves whoever was already
-         using this tool before per-user files existed, with zero
-         migration needed on their part.
-      3. Otherwise, credentials_<username>.enc (even though it
-         doesn't exist yet) - the natural filename for a brand new
-         store for this person; credential_manager.py will offer to
-         create it the first time they run it.
+    Resolution order (the first file that exists wins):
+      1. credentials/credentials_<username>.enc - this person's store.
+      2. credentials_<username>.enc in base_dir itself - a store left
+         in the project root by an earlier version, used in place.
+      3. credentials/credentials.enc, then credentials.enc in base_dir -
+         the original shared file, for whoever was using this tool
+         before per-user files existed. A per-user file always beats it.
+      4. Otherwise credentials/credentials_<username>.enc (even though
+         it doesn't exist yet) - the natural place for a brand new
+         store; credential_manager.py and the GUI offer to create it.
 
-    If the OS username can't be determined for any reason, falls back
-    to the original fixed filename, matching this tool's original
-    (pre-multi-user) behavior exactly.
+    If the OS username can't be determined for any reason, only the
+    original fixed filename is considered (in credentials/ first).
     """
+    folder = os.path.join(base_dir, CREDENTIALS_DIR)
+    legacy_candidates = [os.path.join(folder, DEFAULT_CREDENTIALS_FILE),
+                         os.path.join(base_dir, DEFAULT_CREDENTIALS_FILE)]
     try:
         username = getpass.getuser()
     except Exception:
-        return os.path.join(base_dir, DEFAULT_CREDENTIALS_FILE)
+        username = None
 
-    per_user_path = os.path.join(base_dir, f"credentials_{username}.enc")
-    legacy_path = os.path.join(base_dir, DEFAULT_CREDENTIALS_FILE)
+    candidates = []
+    if username:
+        candidates += [os.path.join(folder, f"credentials_{username}.enc"),
+                       os.path.join(base_dir, f"credentials_{username}.enc")]
+    candidates += legacy_candidates
 
-    if os.path.exists(per_user_path):
-        return per_user_path
-    if os.path.exists(legacy_path):
-        return legacy_path
-    return per_user_path
+    for path in candidates:
+        if os.path.exists(path):
+            return path
+    return personal_credentials_path(base_dir)
 
 SALT_SIZE = 16
 NONCE_SIZE = 12
@@ -105,6 +125,10 @@ def save_and_encrypt(filepath: str, credentials: dict, master_password: str) -> 
     key = derive_key(master_password.encode("utf-8"), salt)
     aesgcm = AESGCM(key)
     nonce = os.urandom(NONCE_SIZE)
+
+    folder = os.path.dirname(filepath)
+    if folder:
+        os.makedirs(folder, exist_ok=True)
 
     credentials_bytes = json.dumps(credentials).encode("utf-8")
     encrypted_data = aesgcm.encrypt(nonce, credentials_bytes, None)
