@@ -21,8 +21,9 @@ logic (orchestrator.py), not two.
 Run from the project root:
     python3 gui.py
 
-Requires credentials.enc to already exist (via
-utilities/credential_manager.py) before running anything on the
+Requires your credential store (credentials/credentials_<username>.enc,
+created via utilities/credential_manager.py or the login dialog) before
+running anything on the
 Discovery tab; the Site Manager tab itself needs no credentials.
 """
 
@@ -1390,10 +1391,7 @@ class LoginDialog(tk.Toplevel):
                     f"'{self._path}' might not be your store (e.g. it belongs to someone else "
                     f"on a shared drive). Create your own new personal store instead?",
                 ):
-                    try:
-                        self._path = f"credentials_{getpass.getuser()}.enc"
-                    except Exception:
-                        self._path = credential_store.DEFAULT_CREDENTIALS_FILE
+                    self._path = credential_store.personal_credentials_path()
                     self._store_exists = os.path.exists(self._path)
                     self._failed_attempts = 0
                     self._build_layout()

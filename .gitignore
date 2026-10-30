@@ -1,5 +1,6 @@
 sad.db
-credentials*.enc
+credentials/
+*.enc
 write_queue/
 logs/
 session_logs/

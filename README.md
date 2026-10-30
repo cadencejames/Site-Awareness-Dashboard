@@ -86,7 +86,7 @@ devices and (optionally) CUCM and GEM One.
 
 1. Run `python3 gui.py`. On first launch it walks you through creating
    an encrypted credential store and setting up your device login
-   credentials.
+   credentials. Stores are kept in `credentials/`, one per OS user.
 2. Import your device inventory with `utilities/inventory_import.py`
    (generic CSV importer - point it at whatever inventory export you
    have).
@@ -148,6 +148,7 @@ clean_old_snapshots.py   re-cleans stored config snapshots (dry run by default)
 settings.json            classification banner and GEM One settings
 
 gemone/                  your GEM One script, its output.json, kg_site_map.csv
+credentials/             encrypted credential stores, one per user (never commit these)
 
 utilities/
   db.py                    schema and all database access
