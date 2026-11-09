@@ -65,9 +65,12 @@ def _to_int(value):
         return value
     if isinstance(value, float):
         return int(value) if value == int(value) else None
-    s = str(value).strip()
+    # Text values: drop whitespace and invisible characters, accept "10" and "10.0".
+    s = re.sub(r"[\s\u200b-\u200d\ufeff]", "", str(value))
     if re.fullmatch(r"-?[0-9]+", s):
         return int(s)
+    if re.fullmatch(r"-?[0-9]+\.0+", s):
+        return int(s.split(".")[0])
     return None
 
 
@@ -121,7 +124,10 @@ def normalize_node(row):
     a row without a usable NodeID raises OrionParseError."""
     node_id = _to_int(row.get("NodeID"))
     if node_id is None:
-        raise OrionParseError(f"node row without a usable NodeID: {row.get('NodeID')!r}")
+        raw = row.get("NodeID")
+        raise OrionParseError(
+            f"node row without a usable NodeID: {raw!r} (type {type(raw).__name__}); "
+            f"fields in the row: {', '.join(sorted(row))}")
     ip_raw = row.get("IPAddress", row.get("IP_Address"))
 
     def when(key):
@@ -156,7 +162,7 @@ def normalize_event(row):
     the event's NetworkNode (or NodeID if that is what was selected)."""
     node_id = _to_int(row.get("NetworkNode", row.get("NodeID")))
     if node_id is None:
-        raise OrionParseError("event row without a usable node id")
+        raise OrionParseError(f"event row without a usable node id; fields in the row: {', '.join(sorted(row))}")
     etype = _to_int(row.get("EventType"))
     if etype is None:
         raise OrionParseError(f"event row without a usable EventType: {row.get('EventType')!r}")
@@ -201,8 +207,15 @@ def analyze_event_sequences(events):
       double_down   a Down right after a Down for the same node
       double_up     an Up right after an Up for the same node
       other_types   events of any other type (counted, not replayed)
+
+    and, to show whether repeated Downs are a few chatty nodes or many:
+
+      nodes_with_double_down  how many nodes have at least one repeated Down
+      worst_double_down       the most repeated Downs on any single node
+      median_double_down_gap  median minutes between the two Downs of a pair
+                              (None when there are none)
     """
-    state, first = {}, {}
+    state, first, last_time, doubles, gaps = {}, {}, {}, {}, []
     result = {"events": 0, "nodes": 0, "first_is_up": 0, "first_is_down": 0,
               "double_down": 0, "double_up": 0, "other_types": 0}
     for event in sorted(events, key=event_sort_key):
@@ -217,10 +230,17 @@ def analyze_event_sequences(events):
             first[nid] = etype
         elif previous == etype:
             result["double_down" if etype == EVENT_DOWN else "double_up"] += 1
+            if etype == EVENT_DOWN:
+                doubles[nid] = doubles.get(nid, 0) + 1
+                gaps.append((event["time"] - last_time[nid]).total_seconds() / 60.0)
         state[nid] = etype
+        last_time[nid] = event["time"]
     result["nodes"] = len(state)
     result["first_is_up"] = sum(1 for t in first.values() if t == EVENT_UP)
     result["first_is_down"] = sum(1 for t in first.values() if t == EVENT_DOWN)
+    result["nodes_with_double_down"] = len(doubles)
+    result["worst_double_down"] = max(doubles.values()) if doubles else 0
+    result["median_double_down_gap"] = sorted(gaps)[len(gaps) // 2] if gaps else None
     return result
 
 

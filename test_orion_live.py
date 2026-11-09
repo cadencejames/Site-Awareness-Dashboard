@@ -146,7 +146,11 @@ def run(client, args, scrub, host):
     heading("Nodes")
     print(f"Nodes: {len(nodes)}")
     if node_errors:
-        print(f"  {len(node_errors)} row(s) could not be understood, e.g. {node_errors[0]}")
+        print(f"  {len(node_errors)} row(s) could not be understood. First few:")
+        for message in node_errors[:3]:
+            print(f"    {message}")
+    if not nodes:
+        print("  WARNING: no node could be read, so the site breakdown below is empty and means nothing.")
     counts = Counter(n["status"] for n in nodes)
     for status, count in sorted(counts.items(), key=lambda kv: (kv[0] is None, kv[0])):
         label = status_names.get(status, f"status {status}")
@@ -207,6 +211,9 @@ def run(client, args, scrub, host):
     print(f"  nodes whose first event is an Up (already down when the window opened): {seq['first_is_up']}")
     print(f"  nodes whose first event is a Down: {seq['first_is_down']}")
     print(f"  Down right after a Down (missing Up): {seq['double_down']}")
+    if seq["double_down"]:
+        print(f"    spread over {seq['nodes_with_double_down']} node(s); the worst has {seq['worst_double_down']}; "
+              f"median gap between the two Downs: {seq['median_double_down_gap']:.1f} min")
     print(f"  Up right after an Up (missing Down): {seq['double_up']}")
     print(f"  events for nodes no longer in Orion: {orphans}")
     down_now = sum(1 for n in nodes if n["status"] == op.STATUS_DOWN)
