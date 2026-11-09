@@ -6,24 +6,30 @@ Run it from the SAD project root on the machine that can reach Orion:
 
     python test_orion_live.py --host orion.example.local --days 30 --scrub
 
-It signs in with the stored 'tacacs' login (the same one SAD uses for devices;
-use --prompt to type a username and password instead), asks Orion a handful of
-read-only questions, and prints a report. Nothing is written to Orion or to
-SAD's database, and the password is never printed or saved.
+It signs in with the stored 'tacacs' login (use --prompt to type a username and
+password instead), asks Orion a handful of read-only questions, and prints a
+report. Nothing is written to Orion or to SAD's database, and the password is
+never printed or saved.
+
+Only devices SAD knows are reported on. Each Orion node is matched to a SAD
+device by IP address (every IP SAD holds for the device), then by host name;
+all other nodes (servers, workstations, ...) are counted and ignored. Use
+--all-nodes to switch the filter off. The database is read from sad.db in the
+project root, or from --sad-db PATH.
 
 What it reports:
   - Orion's clock, and which node properties this Orion version offers
-  - how many nodes there are, their statuses, and how they spread across the
-    second octet of their IP address (the site number)
+  - how many Orion nodes match SAD devices, how, and what could not be matched
+  - SAD sites with no deciding node (no seed flagged, or the seed is not in Orion)
   - how far back Orion's event history goes (retention), which event types it
-    records, and whether Down/Up events pair up cleanly
-  - with --octet N: every node and Down/Up event for one site, so you can
-    compare against Orion's own console or what is known to have happened
+    records, and whether Down/Up events pair up cleanly for SAD devices
+  - with --octet N: every SAD device and Down/Up event for the site whose SAD
+    site octet is N
 
-Sharing the output: add --scrub and node names, IP addresses and site numbers
+Sharing the output: add --scrub and device names, IP addresses and site numbers
 are replaced with Node-1, Site-2, ... Counts, statuses, event types and times
 are kept. --dump FILE saves a small sample (one site with --octet, otherwise
-the first 50 nodes) as JSON that can serve as realistic test data; with
+the first 50 matched nodes) as JSON that can serve as realistic test data; with
 --scrub it contains no names or addresses either.
 
 Settings (optional) in settings.json:
@@ -34,10 +40,8 @@ Command-line options override them.
 import argparse
 import getpass
 import json
-import linecache
 import os
 import sys
-import traceback
 from collections import Counter
 from datetime import datetime
 
@@ -45,6 +49,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(HERE, "utilities"))
 
 import orion_client as oc  # noqa: E402
+import orion_match as om  # noqa: E402
 import orion_parser as op  # noqa: E402
 
 STAMP = "%Y-%m-%d %H:%M"
@@ -109,151 +114,141 @@ def heading(text):
     print(f"\n== {text} ==")
 
 
-def simple_intervals(node_events, now):
+def simple_intervals(node_events):
     """Raw down intervals for one node, no thresholds: [(start|None, end|None)]."""
     out, start, down = [], None, False
     for e in sorted(node_events, key=op.event_sort_key):
         if e["type"] == op.EVENT_DOWN and not down:
             start, down = e["time"], True
         elif e["type"] == op.EVENT_UP:
-            if down:
-                out.append((start, e["time"]))
-            else:
-                out.append((None, e["time"]))    # was already down when the window opened
+            out.append((start, e["time"]) if down else (None, e["time"]))   # no Down seen: it was already down
             down = False
     if down:
         out.append((start, None))
     return out
 
 
+def load_sad(args):
+    """(devices, note). devices is None when SAD filtering is off or unavailable."""
+    if args.all_nodes:
+        return None, "SAD filtering is off (--all-nodes): every Orion node is included."
+    if not os.path.exists(args.sad_db):
+        return None, f"SAD database not found at {args.sad_db}; showing every Orion node. Use --sad-db PATH."
+    import db
+    with db.get_conn(args.sad_db) as conn:
+        return om.load_sad_devices(conn), None
+
+
 def run(client, args, scrub, host):
-    # ---- 1. connection ------------------------------------------------
+    # ---- 1. connection and properties ----------------------------------
     heading("Connection")
     now = client.server_now()
     shown_host = "<orion host>" if scrub.enabled else host
     print(f"Connected to {shown_host}.")
     print(f"Orion server time: {now:%Y-%m-%d %H:%M:%S}   (this machine: {datetime.now():%Y-%m-%d %H:%M:%S})")
     print("Event times below are on the Orion server's clock.")
-
-    # ---- 2. node properties --------------------------------------------
     have, missing = client.node_fields()
-    heading("Node properties")
-    print(f"Available: {', '.join(have)}")
-    missing_text = ", ".join(missing) if missing else "none"
-    print(f"Not on this Orion version: {missing_text}")
+    print(f"Node properties available: {', '.join(have)}")
+    print(f"Not on this Orion version: {', '.join(missing) if missing else 'none'}")
 
-    # ---- 3. nodes ------------------------------------------------------
+    # ---- 2. nodes and the SAD match ------------------------------------
     nodes, node_errors = client.fetch_nodes()
     status_names = best_effort(client.status_names, {})
+    node_by_id = {n["node_id"]: n for n in nodes}
     heading("Nodes")
-    print(f"Nodes: {len(nodes)}")
+    print(f"Orion nodes: {len(nodes)}")
     if node_errors:
         print(f"  {len(node_errors)} row(s) could not be understood. First few:")
         for message in node_errors[:3]:
             print(f"    {message}")
-    if not nodes:
-        print("  WARNING: no node could be read, so the site breakdown below is empty and means nothing.")
-    if node_errors:
-        print(f"  parser file in use: {op.__file__}")
-        try:
-            sample = client.query("SELECT TOP 1 n.NodeID, n.Caption, n.Status FROM Orion.Nodes n")[0]
-            print(f"  fresh sample row: NodeID={sample.get('NodeID')!r}; _to_int gives {op._to_int(sample.get('NodeID'))!r}")
-            try:
-                op.normalize_node(sample)
-                print("  normalize_node accepts that row")
-            except op.OrionParseError as exc:
-                print(f"  normalize_node rejects that row: {exc}")
-                frame = traceback.extract_tb(exc.__traceback__)[-1]
-                print(f"    raised at line {frame.lineno} of {os.path.basename(frame.filename)}; the code around it:")
-                for number in range(max(frame.lineno - 6, 1), frame.lineno + 2):
-                    print(f"      {number}: {linecache.getline(frame.filename, number).rstrip()}")
-        except (oc.OrionError, IndexError) as exc:
-            print(f"  could not fetch a sample node row: {exc}")
-    counts = Counter(n["status"] for n in nodes)
+    devices, note = load_sad(args)
+    if note:
+        print(note)
+
+    view = {}      # node_id -> {"node", "site", "device", "method"} for every node that counts
+    if devices is None:
+        for n in nodes:
+            site = str(op.second_octet(n["ip"])) if n["ip"] else "?"
+            view[n["node_id"]] = {"node": n, "site": site, "device": None, "method": "-"}
+        dev_by_id = {}
+    else:
+        result = om.match_nodes(nodes, devices)
+        dev_by_id = {d["device_id"]: d for d in devices}
+        for nid, info in result["matches"].items():
+            device = dev_by_id[info["device_id"]]
+            view[nid] = {"node": node_by_id[nid], "site": device["site_octet"], "device": device, "method": info["method"]}
+        methods = Counter(info["method"] for info in result["matches"].values())
+        sites_in_sad = len({d["site_octet"] for d in devices})
+        print(f"SAD devices loaded: {len(devices)} at {sites_in_sad} sites")
+        print(f"Orion nodes that are SAD devices: {len(view)}  "
+              f"(by IP {methods['ip']}, by IP and name {methods['ip+name']}, by host name {methods['hostname']})")
+        print(f"Orion nodes ignored (not in SAD): {len(result['unmatched'])}")
+        if result["ambiguous"]:
+            print(f"Orion nodes that could not be decided (several SAD devices fit): {len(result['ambiguous'])}")
+        if result["multi_node_devices"]:
+            print(f"SAD devices matched by more than one Orion node: {len(result['multi_node_devices'])}")
+        if result["octet_mismatch"]:
+            print(f"Matched nodes whose IP second octet differs from the SAD site: {len(result['octet_mismatch'])}")
+        print(f"SAD devices with no Orion node: {len(result['devices_without_node'])}")
+        lacking = om.sites_lacking_seed_node(devices, result)
+        print(f"SAD sites with no deciding node for outage tracking: {len(lacking)}")
+        for problem in lacking[:10]:
+            site_text = scrub.label("Site", problem["site_octet"]) if scrub.enabled else f"site {problem['site_octet']} {problem['site_name']}".rstrip()
+            print(f"    {site_text}: {problem['reason']}")
+        if len(lacking) > 10:
+            print(f"    ... {len(lacking) - 10} more")
+
+    kept = [v["node"] for v in view.values()]
+    counts = Counter(n["status"] for n in kept)
+    print("Status of the nodes that count:")
     for status, count in sorted(counts.items(), key=lambda kv: (kv[0] is None, kv[0])):
-        label = status_names.get(status, f"status {status}")
-        shown = f"{label} ({status})"
+        shown = f"{status_names.get(status, f'status {status}')} ({status})"
         print(f"  {shown:<14} {count:5d}")
-    unmanaged = sum(1 for n in nodes if n["unmanaged"])
     if "Unmanaged" in have:
-        print(f"Unmanaged nodes: {unmanaged}")
-    with_ip = [n for n in nodes if n["ip"]]
-    print(f"Nodes with a usable IPv4 address: {len(with_ip)}   without: {len(nodes) - len(with_ip)}")
+        print(f"Unmanaged among them: {sum(1 for n in kept if n['unmanaged'])}")
 
-    firsts = Counter(int(n["ip"].split(".")[0]) for n in with_ip)
-    firsts_text = ", ".join(f"{octet} ({count} nodes)" for octet, count in sorted(firsts.items()))
-    print(f"First octets in use: {firsts_text}")
-    by_octet = Counter(op.second_octet(n["ip"]) for n in with_ip)
-    ranked = sorted(by_octet.items(), key=lambda kv: (-kv[1], kv[0]))
-    site_label = {octet: (scrub.label("Site", octet) if scrub.enabled else f"second octet {octet}") for octet, _ in ranked}
-    print(f"Distinct second octets (site numbers): {len(by_octet)}")
-    buckets = [("1 node", 1, 1), ("2-3 nodes", 2, 3), ("4-10 nodes", 4, 10), ("11+ nodes", 11, 10 ** 9)]
-    for name, lo, hi in buckets:
-        n_sites = sum(1 for _, c in ranked if lo <= c <= hi)
-        print(f"  sites with {name:<10} {n_sites:4d}")
+    per_site = Counter(v["site"] for v in view.values())
+    ranked = sorted(per_site.items(), key=lambda kv: (-kv[1], kv[0]))
+    site_label = {site: (scrub.label("Site", site) if scrub.enabled else f"site {site}") for site, _ in ranked}
+    print(f"Sites with at least one Orion node: {len(per_site)}")
+    for name, lo, hi in (("1 node", 1, 1), ("2-3 nodes", 2, 3), ("4-10 nodes", 4, 10), ("11+ nodes", 11, 10 ** 9)):
+        print(f"  sites with {name:<10} {sum(1 for _, c in ranked if lo <= c <= hi):4d}")
     print("Largest sites by node count:")
-    for octet, count in ranked[:5]:
-        print(f"  {site_label[octet]:<18} {count:4d} nodes")
+    for site, count in ranked[:5]:
+        print(f"  {site_label[site]:<18} {count:4d} nodes")
 
-    # ---- 4. events -----------------------------------------------------
+    # ---- 3. events -----------------------------------------------------
     heading("Event history (nodes only)")
     span = client.event_span()
     if span["total"]:
         age = (now - span["earliest"]).days
-        oldest, newest = span["earliest"].strftime(STAMP), span["latest"].strftime(STAMP)
-        print(f"Retention: Orion holds {span['total']} node events, oldest {oldest} ({age} days before server time), newest {newest}.")
+        print(f"Retention: Orion holds {span['total']} node events, oldest {span['earliest']:{STAMP}} "
+              f"({age} days before server time), newest {span['latest']:{STAMP}}.")
         if age < args.days:
             print(f"  NOTE: the oldest event is newer than the {args.days}-day lookback, so history starts there.")
     else:
         print("Retention: Orion holds no node events at all.")
     type_names = best_effort(client.event_type_names, {})
     type_counts = client.event_type_counts(args.days)
-    print(f"Event types in the last {args.days} days:")
+    print(f"Event types in the last {args.days} days (all Orion nodes):")
     for etype, count in sorted(type_counts.items()):
-        type_label = type_names.get(etype, f"type {etype}")
-        shown = f"{type_label} ({etype})"
+        shown = f"{type_names.get(etype, f'type {etype}')} ({etype})"
         print(f"  {shown:<24} {count:6d}")
-    others = sorted(t for t in type_counts if t not in (op.EVENT_DOWN, op.EVENT_UP))
-    if others:
-        other_text = ", ".join(type_names.get(t, f"type {t}") for t in others)
-        print(f"Other event types are present ({other_text}). They are not replayed as Down/Up; check whether any of them mean 'unreachable'.")
 
     events, event_errors = client.fetch_events(args.days)
-    print(f"Down/Up events fetched: {len(events)}")
     if event_errors:
         print(f"  {len(event_errors)} event row(s) could not be understood. First few:")
         for message in event_errors[:3]:
             print(f"    {message}")
-    fetched_by_type = Counter(e["type"] for e in events)
-    suspicious = False
+    fetched = Counter(e["type"] for e in events)
     for etype in (op.EVENT_DOWN, op.EVENT_UP):
-        in_orion, got = type_counts.get(etype, 0), fetched_by_type.get(etype, 0)
-        differs = abs(in_orion - got) > max(2, in_orion // 100)   # a couple of events can age out between the two queries
-        flag = "   <-- DIFFERENT" if differs else ""
-        suspicious = suspicious or differs
+        in_orion, got = type_counts.get(etype, 0), fetched.get(etype, 0)
+        flag = "   <-- DIFFERENT" if abs(in_orion - got) > max(2, in_orion // 100) else ""
         print(f"  {type_names.get(etype, f'type {etype}')} ({etype}): Orion reports {in_orion}, fetched {got}{flag}")
-    if suspicious:
-        print("  The counts above should match. Raw look at the newest events of each type, as Orion sent them:")
-        for etype in (op.EVENT_DOWN, op.EVENT_UP):
-            try:
-                samples = client.sample_events(etype)
-            except oc.OrionError as exc:
-                print(f"    type {etype}: the sample query failed: {exc}")
-                continue
-            for row in samples:
-                parts = [f"{key}={row[key]!r} ({type(row[key]).__name__})" for key in sorted(row)]
-                print(f"    type {etype}: " + "; ".join(parts))
-        print("  Fetching each type on its own:")
-        for etype in (op.EVENT_DOWN, op.EVENT_UP):
-            try:
-                own, own_errors = client.fetch_events(args.days, event_types=(etype,))
-                print(f"    type {etype} alone: {len(own)} rows, {len(own_errors)} unreadable")
-            except oc.OrionError as exc:
-                print(f"    type {etype} alone: failed: {exc}")
-    known = {n["node_id"] for n in nodes}
-    orphans = sum(1 for e in events if e["node_id"] not in known)
-    seq = op.analyze_event_sequences(events)
-    print(f"Nodes with Down/Up events: {seq['nodes']}")
+    mine = [e for e in events if e["node_id"] in view]
+    print(f"Down/Up events fetched: {len(events)}; for nodes that count: {len(mine)}")
+    seq = op.analyze_event_sequences(mine)
+    print(f"Nodes that count with Down/Up events: {seq['nodes']}")
     print(f"  nodes whose first event is an Up (already down when the window opened): {seq['first_is_up']}")
     print(f"  nodes whose first event is a Down: {seq['first_is_down']}")
     print(f"  Down right after a Down (missing Up): {seq['double_down']}")
@@ -261,28 +256,37 @@ def run(client, args, scrub, host):
         print(f"    spread over {seq['nodes_with_double_down']} node(s); the worst has {seq['worst_double_down']}; "
               f"median gap between the two Downs: {seq['median_double_down_gap']:.1f} min")
     print(f"  Up right after an Up (missing Down): {seq['double_up']}")
-    print(f"  events for nodes no longer in Orion: {orphans}")
-    down_now = sum(1 for n in nodes if n["status"] == op.STATUS_DOWN)
-    print(f"Nodes currently Down: {down_now}")
+    print(f"  events for nodes Orion no longer lists: {sum(1 for e in events if e['node_id'] not in node_by_id)}")
+    print(f"Nodes that count and are Down right now: {sum(1 for n in kept if n['status'] == op.STATUS_DOWN)}")
 
-    # ---- 5. one site ---------------------------------------------------
-    sample_nodes = nodes[:50]
+    # ---- 4. one site ---------------------------------------------------
+    sample = sorted(view.values(), key=lambda v: v["node"]["node_id"])[:50]
+
+    def node_name(v):
+        if scrub.enabled:
+            return scrub.label("Node", v["node"]["node_id"])
+        return v["device"]["hostname"] if v["device"] else (v["node"]["caption"] or f"node {v['node']['node_id']}")
+
     if args.octet is not None:
-        site_nodes = sorted((n for n in nodes if op.second_octet(n["ip"]) == args.octet), key=lambda n: n["node_id"])
-        sample_nodes = site_nodes
-        name = scrub.label("Site", args.octet) if scrub.enabled else f"second octet {args.octet}"
-        heading(f"One site: {name}")
-        if not site_nodes:
-            print("No node has that second octet.")
+        site = str(args.octet)
+        site_view = sorted((v for v in view.values() if v["site"] == site), key=lambda v: v["node"]["node_id"])
+        sample = site_view
+        heading(f"One site: {scrub.label('Site', site) if scrub.enabled else f'site {site}'}")
+        if not site_view:
+            print("No node that counts belongs to that site.")
         else:
-            def node_name(n):
-                return scrub.label("Node", n["node_id"]) if scrub.enabled else (n["caption"] or f"node {n['node_id']}")
-            for n in site_nodes:
+            for v in site_view:
+                n = v["node"]
+                tags = []
+                if v["device"] and v["device"]["is_seed"]:
+                    tags.append("seed")
+                if v["method"] != "-":
+                    tags.append(f"matched by {v['method']}")
+                shown_ip = "" if scrub.enabled else f"  {n['ip'] or ''}"
                 label = status_names.get(n["status"], f"status {n['status']}")
-                shown_ip = "" if scrub.enabled else "  " + (n["ip"] or "")
-                print(f"  {node_name(n):<28} now {label:<12}{shown_ip}".rstrip())
-            ids = {n["node_id"] for n in site_nodes}
-            by_id = {n["node_id"]: n for n in site_nodes}
+                print(f"  {node_name(v):<28} now {label:<10} [{', '.join(tags)}]{shown_ip}".rstrip())
+            ids = {v["node"]["node_id"] for v in site_view}
+            by_id = {v["node"]["node_id"]: v for v in site_view}
             site_events = sorted((e for e in events if e["node_id"] in ids), key=op.event_sort_key)
             print(f"\nDown/Up events ({len(site_events)}):")
             for e in site_events[:80]:
@@ -292,37 +296,33 @@ def run(client, args, scrub, host):
                 print(f"  ... {len(site_events) - 80} more")
             print("\nRaw down intervals per node (no thresholds, no merging):")
             any_interval = False
-            for n in site_nodes:
-                for start, end in simple_intervals([e for e in site_events if e["node_id"] == n["node_id"]], now):
+            for v in site_view:
+                for start, end in simple_intervals([e for e in site_events if e["node_id"] == v["node"]["node_id"]]):
                     any_interval = True
-                    s = "before window" if start is None else start.strftime(STAMP)
-                    t = "still down" if end is None else end.strftime(STAMP)
-                    if start is None:
-                        dur = "began before the window, length unknown"
-                    else:
-                        dur = fmt_duration((end or now) - start)
-                    print(f"  {node_name(n):<28} {s} -> {t}   ({dur})")
+                    s = "before window" if start is None else f"{start:{STAMP}}"
+                    t = "still down" if end is None else f"{end:{STAMP}}"
+                    dur = "began before the window, length unknown" if start is None else fmt_duration((end or now) - start)
+                    print(f"  {node_name(v):<28} {s} -> {t}   ({dur})")
             if not any_interval:
                 print("  none in this window")
 
-    # ---- 6. dump -------------------------------------------------------
+    # ---- 5. dump -------------------------------------------------------
     if args.dump:
-        ids = {n["node_id"] for n in sample_nodes}
-        node_order = sorted(ids)
-        ref = {nid: i + 1 for i, nid in enumerate(node_order)}
-        by_id = {n["node_id"]: n for n in nodes}
+        ids = [v["node"]["node_id"] for v in sample]
+        ref = {nid: i + 1 for i, nid in enumerate(ids)}
         out_nodes = []
-        for nid in node_order:
-            n = by_id[nid]
-            entry = {"node": ref[nid], "status": n["status"], "unmanaged": n["unmanaged"]}
-            entry["site"] = scrub.label("Site", op.second_octet(n["ip"])) if scrub.enabled else op.second_octet(n["ip"])
+        for v in sample:
+            n = v["node"]
+            entry = {"node": ref[n["node_id"]], "status": n["status"], "unmanaged": n["unmanaged"],
+                     "site": scrub.label("Site", v["site"]) if scrub.enabled else v["site"],
+                     "seed": bool(v["device"] and v["device"]["is_seed"]), "match": v["method"]}
             if scrub.enabled:
-                entry["name"] = scrub.label("Node", nid)
+                entry["name"] = scrub.label("Node", n["node_id"])
             else:
-                entry.update({"name": n["caption"], "ip": n["ip"], "dns": n["dns"], "node_id": nid})
+                entry.update({"name": node_name(v), "ip": n["ip"], "orion_caption": n["caption"], "node_id": n["node_id"]})
             out_nodes.append(entry)
         out_events = [{"node": ref[e["node_id"]], "time": e["time"].isoformat(), "type": e["type"]}
-                      for e in sorted(events, key=op.event_sort_key) if e["node_id"] in ids]
+                      for e in sorted(events, key=op.event_sort_key) if e["node_id"] in ref]
         payload = {"note": "scrubbed sample" if scrub.enabled else "UNSCRUBBED sample - contains real names and addresses",
                    "server_now": now.isoformat(), "days": args.days, "nodes": out_nodes, "events": out_events}
         with open(args.dump, "w", encoding="utf-8") as fh:
@@ -341,7 +341,9 @@ def parse_args(argv):
     p.add_argument("--host", help="Orion server name or IP (or set orion.host in settings.json)")
     p.add_argument("--port", type=int, default=int(cfg.get("port") or oc.DEFAULT_PORT))
     p.add_argument("--days", type=int, default=30, help="how many days of events to look at (default 30)")
-    p.add_argument("--octet", type=int, help="show every node and event for the site with this second octet")
+    p.add_argument("--octet", help="show every SAD device and event for the site with this SAD site octet")
+    p.add_argument("--sad-db", default=os.path.join(HERE, "sad.db"), help="SAD database to read (default: sad.db in the project root)")
+    p.add_argument("--all-nodes", action="store_true", help="do not filter to SAD devices; use every Orion node")
     p.add_argument("--scrub", action="store_true", help="replace names, addresses and site numbers with labels")
     p.add_argument("--dump", metavar="FILE", help="save a small JSON sample of nodes and events")
     p.add_argument("--prompt", action="store_true", help="type the username and password instead of using the stored login")
