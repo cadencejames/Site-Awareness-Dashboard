@@ -203,7 +203,26 @@ def run(client, args, scrub, host):
     events, event_errors = client.fetch_events(args.days)
     print(f"Down/Up events fetched: {len(events)}")
     if event_errors:
-        print(f"  {len(event_errors)} row(s) could not be understood, e.g. {event_errors[0]}")
+        print(f"  {len(event_errors)} event row(s) could not be understood. First few:")
+        for message in event_errors[:3]:
+            print(f"    {message}")
+    fetched_by_type = Counter(e["type"] for e in events)
+    suspicious = False
+    for etype in (op.EVENT_DOWN, op.EVENT_UP):
+        in_orion, got = type_counts.get(etype, 0), fetched_by_type.get(etype, 0)
+        flag = "" if in_orion == got else "   <-- DIFFERENT"
+        suspicious = suspicious or in_orion != got
+        print(f"  {type_names.get(etype, f'type {etype}')} ({etype}): Orion reports {in_orion}, fetched {got}{flag}")
+    if suspicious:
+        print("  The counts above should match. Raw look at the newest events of each type, as Orion sent them:")
+        for etype in (op.EVENT_DOWN, op.EVENT_UP):
+            samples = best_effort(lambda: client.sample_events(etype), None)
+            if samples is None:
+                print(f"    type {etype}: the sample query failed")
+                continue
+            for row in samples:
+                parts = [f"{key}={row[key]!r} ({type(row[key]).__name__})" for key in sorted(row)]
+                print(f"    type {etype}: " + "; ".join(parts))
     known = {n["node_id"] for n in nodes}
     orphans = sum(1 for e in events if e["node_id"] not in known)
     seq = op.analyze_event_sequences(events)

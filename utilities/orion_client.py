@@ -33,6 +33,7 @@ MAX_PAGES = 2000  # safety stop for a runaway pager (2000 pages x page_size rows
 # ones are probed once and quietly left out on an Orion version that lacks them.
 NODE_REQUIRED = ("NodeID", "Caption", "Status")
 NODE_IP_CANDIDATES = ("IPAddress", "IP_Address")
+EVENT_SAMPLE_FIELDS = ("EventID", "EventTime", "EventType", "NetworkNode", "NetObjectID", "NetObjectType")
 NODE_OPTIONAL = ("DNS", "SysName", "StatusDescription", "Vendor", "MachineType",
                  "PollInterval", "Unmanaged", "UnManageFrom", "UnManageUntil")
 
@@ -252,6 +253,14 @@ class OrionClient:
             wanted = set(node_ids)
             events = [e for e in events if e["node_id"] in wanted]
         return events, errors
+
+    def sample_events(self, event_type, limit=3):
+        """The newest few raw node events of one type, exactly as Orion sent them
+        (no normalising). For diagnosing odd results."""
+        fields = ", ".join(f"e.{name}" for name in EVENT_SAMPLE_FIELDS)
+        return self.query(
+            f"SELECT TOP {int(limit)} {fields} FROM Orion.Events e "
+            f"WHERE e.NetObjectType = 'N' AND e.EventType = {int(event_type)} ORDER BY e.EventID DESC")
 
     def node_status_counts(self):
         """{status: number of nodes}."""
