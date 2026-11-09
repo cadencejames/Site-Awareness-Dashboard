@@ -241,10 +241,19 @@ def run(client, args, scrub, host):
         for message in event_errors[:3]:
             print(f"    {message}")
     fetched = Counter(e["type"] for e in events)
+    any_differs = False
     for etype in (op.EVENT_DOWN, op.EVENT_UP):
         in_orion, got = type_counts.get(etype, 0), fetched.get(etype, 0)
-        flag = "   <-- DIFFERENT" if abs(in_orion - got) > max(2, in_orion // 100) else ""
+        differs = abs(in_orion - got) > max(2, in_orion // 100)
+        any_differs = any_differs or differs
+        flag = "   <-- DIFFERENT" if differs else ""
         print(f"  {type_names.get(etype, f'type {etype}')} ({etype}): Orion reports {in_orion}, fetched {got}{flag}")
+    if client.last_event_duplicates:
+        print(f"  WARNING: {client.last_event_duplicates} event(s) came back more than once and were dropped.")
+    if any_differs:
+        print("  Event queries actually sent:")
+        for q in client.last_event_queries:
+            print(f"    {q['clause']} -> {q['rows']} rows, event types received: {q['types_received']}")
     mine = [e for e in events if e["node_id"] in view]
     print(f"Down/Up events fetched: {len(events)}; for nodes that count: {len(mine)}")
     seq = op.analyze_event_sequences(mine)

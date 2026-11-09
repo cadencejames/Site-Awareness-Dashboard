@@ -17,6 +17,7 @@ All times are the Orion server's own clock (see orion_parser).
 import base64
 import http.client
 import json
+import re
 import socket
 import ssl
 import urllib.error
@@ -86,6 +87,8 @@ class OrionClient:
             handlers.append(urllib.request.HTTPSHandler(context=ctx))
         self._opener = urllib.request.build_opener(*handlers)
         self._node_fields = None
+        self.last_event_queries = []
+        self.last_event_duplicates = 0
 
     def __repr__(self):
         return f"<OrionClient {self.scheme}://{self.host}:{self.port} as {self.username}>"
@@ -246,16 +249,30 @@ class OrionClient:
         days = int(days)
         if days < 1 or days > 3650:
             raise OrionError("days must be between 1 and 3650.")
-        events, errors = [], []
-        for etype in event_types:
-            rows = self._keyset(
+        events, errors, seen_ids = [], [], set()
+        self.last_event_queries = []     # what was really sent, for diagnosing odd results
+        duplicates = 0
+        for etype in dict.fromkeys(int(t) for t in event_types):
+            swql = (
                 f"SELECT TOP {self.page_size} e.EventID, e.EventTime, e.EventType, e.NetworkNode FROM Orion.Events e "
-                f"WHERE e.NetObjectType = 'N' AND e.EventType = {int(etype)} "
-                f"AND e.EventTime >= ADDDAY(-{days}, GETDATE()) AND e.EventID > @last ORDER BY e.EventID",
-                "EventID")
+                f"WHERE e.NetObjectType = 'N' AND e.EventType = {etype} "
+                f"AND e.EventTime >= ADDDAY(-{days}, GETDATE()) AND e.EventID > @last ORDER BY e.EventID")
+            rows = self._keyset(swql, "EventID")
+            received = sorted({op._to_int(r.get("EventType")) for r in rows if op._to_int(r.get("EventType")) is not None})
+            self.last_event_queries.append({"clause": re.search(r"e\.EventType = \d+", swql).group(0),
+                                            "rows": len(rows), "types_received": received})
+            wrong = [t for t in received if t != etype]
+            if wrong:
+                raise OrionError(f"Asked Orion for event type {etype} but it returned type(s) {wrong}; refusing to continue.")
             items, errs = op.normalize_rows(rows, op.normalize_event)
-            events.extend(items)
             errors.extend(errs)
+            for item in items:
+                if item["event_id"] is not None and item["event_id"] in seen_ids:
+                    duplicates += 1
+                    continue
+                seen_ids.add(item["event_id"])
+                events.append(item)
+        self.last_event_duplicates = duplicates
         events.sort(key=op.event_sort_key)
         if node_ids is not None:
             wanted = set(node_ids)
