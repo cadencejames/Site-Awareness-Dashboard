@@ -151,6 +151,18 @@ def run(client, args, scrub, host):
             print(f"    {message}")
     if not nodes:
         print("  WARNING: no node could be read, so the site breakdown below is empty and means nothing.")
+    if node_errors:
+        print(f"  parser file in use: {op.__file__}")
+        try:
+            sample = client.query("SELECT TOP 1 n.NodeID, n.Caption, n.Status FROM Orion.Nodes n")[0]
+            print(f"  fresh sample row: NodeID={sample.get('NodeID')!r}; _to_int gives {op._to_int(sample.get('NodeID'))!r}")
+            try:
+                op.normalize_node(sample)
+                print("  normalize_node accepts that row")
+            except op.OrionParseError as exc:
+                print(f"  normalize_node rejects that row: {exc}")
+        except (oc.OrionError, IndexError) as exc:
+            print(f"  could not fetch a sample node row: {exc}")
     counts = Counter(n["status"] for n in nodes)
     for status, count in sorted(counts.items(), key=lambda kv: (kv[0] is None, kv[0])):
         label = status_names.get(status, f"status {status}")
@@ -216,13 +228,21 @@ def run(client, args, scrub, host):
     if suspicious:
         print("  The counts above should match. Raw look at the newest events of each type, as Orion sent them:")
         for etype in (op.EVENT_DOWN, op.EVENT_UP):
-            samples = best_effort(lambda: client.sample_events(etype), None)
-            if samples is None:
-                print(f"    type {etype}: the sample query failed")
+            try:
+                samples = client.sample_events(etype)
+            except oc.OrionError as exc:
+                print(f"    type {etype}: the sample query failed: {exc}")
                 continue
             for row in samples:
                 parts = [f"{key}={row[key]!r} ({type(row[key]).__name__})" for key in sorted(row)]
                 print(f"    type {etype}: " + "; ".join(parts))
+        print("  Fetching each type on its own:")
+        for etype in (op.EVENT_DOWN, op.EVENT_UP):
+            try:
+                own, own_errors = client.fetch_events(args.days, event_types=(etype,))
+                print(f"    type {etype} alone: {len(own)} rows, {len(own_errors)} unreadable")
+            except oc.OrionError as exc:
+                print(f"    type {etype} alone: failed: {exc}")
     known = {n["node_id"] for n in nodes}
     orphans = sum(1 for e in events if e["node_id"] not in known)
     seq = op.analyze_event_sequences(events)

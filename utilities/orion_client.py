@@ -257,10 +257,16 @@ class OrionClient:
     def sample_events(self, event_type, limit=3):
         """The newest few raw node events of one type, exactly as Orion sent them
         (no normalising). For diagnosing odd results."""
-        fields = ", ".join(f"e.{name}" for name in EVENT_SAMPLE_FIELDS)
-        return self.query(
-            f"SELECT TOP {int(limit)} {fields} FROM Orion.Events e "
-            f"WHERE e.NetObjectType = 'N' AND e.EventType = {int(event_type)} ORDER BY e.EventID DESC")
+        last_error = None
+        for names in (EVENT_SAMPLE_FIELDS, EVENT_SAMPLE_FIELDS[:4]):
+            fields = ", ".join(f"e.{name}" for name in names)
+            try:
+                return self.query(
+                    f"SELECT TOP {int(limit)} {fields} FROM Orion.Events e "
+                    f"WHERE e.NetObjectType = 'N' AND e.EventType = {int(event_type)} ORDER BY e.EventID DESC")
+            except OrionQueryError as exc:
+                last_error = exc
+        raise last_error
 
     def node_status_counts(self):
         """{status: number of nodes}."""
