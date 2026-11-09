@@ -34,8 +34,10 @@ Command-line options override them.
 import argparse
 import getpass
 import json
+import linecache
 import os
 import sys
+import traceback
 from collections import Counter
 from datetime import datetime
 
@@ -161,6 +163,10 @@ def run(client, args, scrub, host):
                 print("  normalize_node accepts that row")
             except op.OrionParseError as exc:
                 print(f"  normalize_node rejects that row: {exc}")
+                frame = traceback.extract_tb(exc.__traceback__)[-1]
+                print(f"    raised at line {frame.lineno} of {os.path.basename(frame.filename)}; the code around it:")
+                for number in range(max(frame.lineno - 6, 1), frame.lineno + 2):
+                    print(f"      {number}: {linecache.getline(frame.filename, number).rstrip()}")
         except (oc.OrionError, IndexError) as exc:
             print(f"  could not fetch a sample node row: {exc}")
     counts = Counter(n["status"] for n in nodes)
@@ -222,8 +228,9 @@ def run(client, args, scrub, host):
     suspicious = False
     for etype in (op.EVENT_DOWN, op.EVENT_UP):
         in_orion, got = type_counts.get(etype, 0), fetched_by_type.get(etype, 0)
-        flag = "" if in_orion == got else "   <-- DIFFERENT"
-        suspicious = suspicious or in_orion != got
+        differs = abs(in_orion - got) > max(2, in_orion // 100)   # a couple of events can age out between the two queries
+        flag = "   <-- DIFFERENT" if differs else ""
+        suspicious = suspicious or differs
         print(f"  {type_names.get(etype, f'type {etype}')} ({etype}): Orion reports {in_orion}, fetched {got}{flag}")
     if suspicious:
         print("  The counts above should match. Raw look at the newest events of each type, as Orion sent them:")

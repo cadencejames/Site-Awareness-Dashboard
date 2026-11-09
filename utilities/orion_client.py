@@ -237,18 +237,26 @@ class OrionClient:
 
     def fetch_events(self, days, event_types=(op.EVENT_DOWN, op.EVENT_UP), node_ids=None):
         """Node events of the given types from the last `days` days (by the Orion
-        server's clock), normalised and in EventID order. `node_ids`, if given,
-        filters client-side. Returns (events, parse_errors)."""
+        server's clock), normalised and sorted by time then EventID. `node_ids`,
+        if given, filters client-side. Returns (events, parse_errors).
+
+        Each type is requested with its own query. A single "EventType IN (1, 5)"
+        query was seen returning only the first type on a real server, so the
+        types are fetched separately and merged here."""
         days = int(days)
         if days < 1 or days > 3650:
             raise OrionError("days must be between 1 and 3650.")
-        types = ", ".join(str(int(t)) for t in event_types)
-        rows = self._keyset(
-            f"SELECT TOP {self.page_size} e.EventID, e.EventTime, e.EventType, e.NetworkNode FROM Orion.Events e "
-            f"WHERE e.NetObjectType = 'N' AND e.EventType IN ({types}) "
-            f"AND e.EventTime >= ADDDAY(-{days}, GETDATE()) AND e.EventID > @last ORDER BY e.EventID",
-            "EventID")
-        events, errors = op.normalize_rows(rows, op.normalize_event)
+        events, errors = [], []
+        for etype in event_types:
+            rows = self._keyset(
+                f"SELECT TOP {self.page_size} e.EventID, e.EventTime, e.EventType, e.NetworkNode FROM Orion.Events e "
+                f"WHERE e.NetObjectType = 'N' AND e.EventType = {int(etype)} "
+                f"AND e.EventTime >= ADDDAY(-{days}, GETDATE()) AND e.EventID > @last ORDER BY e.EventID",
+                "EventID")
+            items, errs = op.normalize_rows(rows, op.normalize_event)
+            events.extend(items)
+            errors.extend(errs)
+        events.sort(key=op.event_sort_key)
         if node_ids is not None:
             wanted = set(node_ids)
             events = [e for e in events if e["node_id"] in wanted]
