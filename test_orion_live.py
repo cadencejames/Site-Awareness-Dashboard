@@ -43,12 +43,13 @@ import json
 import os
 import sys
 from collections import Counter
-from datetime import datetime
+from datetime import datetime, timedelta
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(HERE, "utilities"))
 
 import orion_client as oc  # noqa: E402
+import outage_calc as ocalc  # noqa: E402
 import orion_match as om  # noqa: E402
 import orion_parser as op  # noqa: E402
 
@@ -137,6 +138,62 @@ def load_sad(args):
     import db
     with db.get_conn(args.sad_db) as conn:
         return om.load_sad_devices(conn), None
+
+
+def report_outages(args, scrub, devices, result, events, now, span, site_label_for, device_label_for):
+    """Run the outage calculator over the lookback window and print what it finds."""
+    window_start = now - timedelta(days=args.days)
+    data_start = span["earliest"] if span and span.get("total") else None
+    calc = ocalc.calculate(events, devices, result, window_start, now, now, data_start=data_start)
+    cfg, notes = calc["settings"], calc["notes"]
+    heading(f"Outages, last {args.days} days")
+    hours = f"{cfg['core_start_minute'] // 60:02d}:{cfg['core_start_minute'] % 60:02d}-{cfg['core_end_minute'] // 60:02d}:{cfg['core_end_minute'] % 60:02d}"
+    print(f"Counted from {calc['coverage']['from']:{STAMP}} to {calc['coverage']['to']:{STAMP}} (Eastern). "
+          f"Core hours {hours} on {len(cfg['core_days'])} days a week: {calc['coverage']['core_minutes']:g} min.")
+    print(f"Minimum down {cfg['min_down_minutes']} min, up interval {cfg['up_interval_minutes']} min, "
+          f"device minimum {cfg['device_min_down_minutes'] or cfg['min_down_minutes']} min. No planned windows are applied here.")
+    tracked = [e for e in calc["sites"].values() if e["tracked"]]
+    skipped = [e for e in calc["sites"].values() if not e["tracked"]]
+    print(f"Sites tracked: {len(tracked)}; skipped (no deciding node): {len(skipped)}")
+    print(f"Left out: {notes['stray_up']} Up with no Down before it, {notes['repeated_down']} repeated Down, "
+          f"{len(notes['before_data'])} outage(s) that began before the data starts (length unknown)")
+    if notes["ambiguous_hour_events"]:
+        print(f"  {notes['ambiguous_hour_events']} event(s) fall in the repeated hour when daylight saving ends; "
+              "their order could not tell which pass they belong to.")
+    with_outages = [e for e in tracked if e["outages"]]
+    ongoing = sum(1 for e in tracked for o in e["outages"] if o["ongoing"])
+    print(f"Sites with at least one site outage: {len(with_outages)}; outages in total: {sum(len(e['outages']) for e in tracked)}; "
+          f"ongoing now: {ongoing}")
+    print(f"Device outages (not the seed; they do not change availability): {sum(len(e['device_outages']) for e in tracked)}")
+    ranked = sorted(with_outages, key=lambda e: (e["availability_all"] if e["availability_all"] is not None else 101, e["site_octet"]))
+    print("Lowest availability (core hours):")
+    for e in ranked[:15]:
+        print(f"  {site_label_for(e['site_octet']):<10} outages {len(e['outages']):3d}  down {e['down']['total']:8.1f} min  "
+              f"core {e['down']['core_unplanned']:7.1f}  availability {e['availability_all']:.3f}%")
+    if args.octet is not None:
+        entry = calc["sites"].get(str(args.octet))
+        heading(f"Outages for {site_label_for(str(args.octet))}")
+        if not entry:
+            print("That site is not in SAD.")
+            return
+        if not entry["tracked"]:
+            print(f"Not tracked: {entry['reason']}.")
+            return
+        print(f"Availability {entry['availability_all']:.3f}% over {entry['core_minutes']:g} core minutes; "
+              f"core down {entry['down']['core_unplanned']:g} min, outside core {entry['down']['outside_unplanned']:g} min.")
+        for o in entry["outages"]:
+            end = "ongoing" if o["end"] is None else f"{o['end']:{STAMP}}"
+            extra = ocalc.describe_parts(o)
+            print(f"  SITE   {o['start']:{STAMP}} -> {end}  {fmt_duration(timedelta(minutes=o['minutes']))}"
+                  f"  (core {o['core_unplanned']:g} / outside {o['outside_unplanned']:g} min)" + (f"  [{extra}]" if extra else ""))
+        by_id = {d["device_id"]: d for d in devices}
+        for o in entry["device_outages"]:
+            end = "ongoing" if o["end"] is None else f"{o['end']:{STAMP}}"
+            extra = ocalc.describe_parts(o)
+            print(f"  device {o['start']:{STAMP}} -> {end}  {fmt_duration(timedelta(minutes=o['minutes']))}  "
+                  f"{device_label_for(by_id[o['device_id']])}" + (f"  [{extra}]" if extra else ""))
+        if not entry["outages"] and not entry["device_outages"]:
+            print("  none in this window")
 
 
 def run(client, args, scrub, host):
@@ -315,6 +372,14 @@ def run(client, args, scrub, host):
             if not any_interval:
                 print("  none in this window")
 
+    # ---- 4b. outages ---------------------------------------------------
+    if args.outages:
+        if devices is None:
+            print("\n--outages needs the SAD database (and no --all-nodes); skipped.")
+        else:
+            report_outages(args, scrub, devices, result, events, now, span, site_label_for=lambda o: scrub.label("Site", o) if scrub.enabled else f"site {o}",
+                           device_label_for=lambda d: scrub.label("Device", d["device_id"]) if scrub.enabled else (d["hostname"] or f"device {d['device_id']}"))
+
     # ---- 5. dump -------------------------------------------------------
     if args.dump:
         ids = [v["node"]["node_id"] for v in sample]
@@ -354,6 +419,7 @@ def parse_args(argv):
     p.add_argument("--sad-db", default=os.path.join(HERE, "sad.db"), help="SAD database to read (default: sad.db in the project root)")
     p.add_argument("--all-nodes", action="store_true", help="do not filter to SAD devices; use every Orion node")
     p.add_argument("--scrub", action="store_true", help="replace names, addresses and site numbers with labels")
+    p.add_argument("--outages", action="store_true", help="also work out site outages and availability for the lookback window (with --octet: list that site's outages)")
     p.add_argument("--dump", metavar="FILE", help="save a small JSON sample of nodes and events")
     p.add_argument("--prompt", action="store_true", help="type the username and password instead of using the stored login")
     p.add_argument("--verify-tls", action="store_true", default=bool(cfg.get("verify_tls", False)),
