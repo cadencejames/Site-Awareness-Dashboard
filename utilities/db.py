@@ -553,6 +553,9 @@ def init_db(db_path: str = DB_PATH) -> None:
         _ensure_column(conn, "sites", "last_tunnel_collection", "TEXT")
         # KG units entered by hand (not reachable by GEM One) vs imported ones.
         _ensure_column(conn, "kg_devices", "source", "TEXT NOT NULL DEFAULT 'gemone'")
+        # Orion outage tracking: its tables and the sites.tier column live in outage_db.py.
+        import outage_db
+        outage_db.ensure_tables(conn)
 
 
 # ---------------------------------------------------------------------

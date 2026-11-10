@@ -47,6 +47,7 @@ import uuid
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import db  # noqa: E402
+import outage_db # noqa: E402
 
 
 # Guards every read OR write of db.CURRENT_USER / CURRENT_CREDENTIAL_STORE
@@ -173,6 +174,9 @@ ACTIONS = {
     "soft_delete_kg_device": db.soft_delete_kg_device,
     "add_manual_kg": db.add_manual_kg,
     "update_manual_kg": db.update_manual_kg,
+    "set_site_tier": outage_db.set_site_tier,
+    "set_site_tiers": outage_db.set_site_tiers,
+    "store_orion_pull": outage_db.store_orion_pull,
 }
 
 
