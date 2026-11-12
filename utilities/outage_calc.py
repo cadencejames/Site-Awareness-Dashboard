@@ -127,12 +127,12 @@ def month_bounds_utc(year, month):
 
 
 DEFAULTS = {
-    "min_down_minutes": 1,          # an outage counts if it lasts at least this long
-    "up_interval_minutes": 1,       # down periods closer together than this are one outage
+    "min_down_minutes": 15,          # an outage counts if it lasts at least this long
+    "up_interval_minutes": 15,       # down periods closer together than this are one outage
     "device_min_down_minutes": None, # None means "same as min_down_minutes"
-    "core_days": (0, 1, 2, 3, 4, 5, 6),    # Monday=0 ... Sunday=6
-    "core_start_minute": 1 * 60,     # minutes after midnight, Eastern
-    "core_end_minute": 23 * 60,
+    "core_days": (0, 1, 2, 3, 4),    # Monday=0 ... Sunday=6
+    "core_start_minute": 5 * 60,     # minutes after midnight, Eastern
+    "core_end_minute": 17 * 60,
     "before_data": "exclude",        # a node whose first event is an Up: "exclude" its unknown-length outage or "clip" it to data_start
 }
 
@@ -287,7 +287,7 @@ def _planned_for_site(planned, octet):
 
 def _buckets(pieces, cov, core, planned):
     """Minutes in each of the four buckets for the pieces, counted only inside `cov`."""
-    seg = _intersect(pieces, [cov]) if cov else []
+    seg = _intersect(pieces, cov) if cov else []
     core_seg = _intersect(seg, core)
     plan_seg = _intersect(seg, planned)
     total, core_total = _minutes(seg), _minutes(core_seg)
@@ -332,7 +332,7 @@ def _record(kind, octet, dev, parts, piece, now_utc, cov, core, planned, planned
     return rec, raw
 
 
-def calculate(events, devices, match, window_start, window_end, now, settings=None, planned=None, data_start=None):
+def calculate(events, devices, match, window_start, window_end, now, settings=None, planned=None, data_start=None, coverage=None):
     """Outages and availability for every SAD site over a window.
 
     events        normalised Orion events (node_id, time, type, event_id), local times
@@ -344,6 +344,9 @@ def calculate(events, devices, match, window_start, window_end, now, settings=No
     planned       planned windows (see _planned_for_site)
     data_start    earliest moment the event history covers, Eastern. Time before it is
                   not counted. Defaults to the earliest event given.
+    coverage      instead of data_start: the periods the stored events cover, as a list of
+                  (start, end) Eastern pairs. Time between them (a gap where nobody pulled)
+                  is not counted. Takes precedence over data_start.
 
     Returns {"sites": {octet: {...}}, "notes": {...}, "settings": {...}}."""
     cfg = dict(DEFAULTS)
@@ -354,18 +357,22 @@ def calculate(events, devices, match, window_start, window_end, now, settings=No
 
     now_utc = to_utc(now)
     utc_times, unresolved_hour = assign_utc(events)
-    if data_start is not None:
-        data_start_utc = to_utc(data_start)
-    elif utc_times:
-        data_start_utc = min(utc_times)
-    else:
-        data_start_utc = None
     ws, we = to_utc(window_start), to_utc(window_end)
-    cov_from = max(ws, data_start_utc) if data_start_utc else ws
-    cov_to = min(we, now_utc)
-    cov = (cov_from, cov_to) if cov_from < cov_to else None
-    core = core_windows(cov_from, max(cov_to, cov_from), cfg) if cov else []
-    core_total = _minutes(_intersect([cov], core)) if cov else 0.0
+    if coverage is not None:
+        known = _norm([(to_utc(a), to_utc(b)) for a, b in coverage])
+        data_start_utc = known[0][0] if known else None
+    else:
+        if data_start is not None:
+            data_start_utc = to_utc(data_start)
+        elif utc_times:
+            data_start_utc = min(utc_times)
+        else:
+            data_start_utc = None
+        known = [(data_start_utc if data_start_utc else ws, now_utc)]
+    # cov: the parts of the report window the event history really covers
+    cov = _intersect(known, [(ws, min(we, now_utc))])
+    core = core_windows(cov[0][0], cov[-1][1], cfg) if cov else []
+    core_total = _minutes(_intersect(cov, core)) if cov else 0.0
 
     # events grouped by node, only for nodes that are SAD devices
     matched = match["matches"]
@@ -406,8 +413,8 @@ def calculate(events, devices, match, window_start, window_end, now, settings=No
                  "seed_device_ids": [d["device_id"] for d in seeds], "outages": [], "device_outages": [],
                  "core_minutes": round(core_total, 2), "down": _round_buckets(_add_buckets({}, {})),
                  "availability_all": None, "availability_excl_planned": None,
-                 "covered_from": local_from_utc(cov[0]) if cov else None,
-                 "covered_to": local_from_utc(cov[1]) if cov else None}
+                 "covered_from": local_from_utc(cov[0][0]) if cov else None,
+                 "covered_to": local_from_utc(cov[-1][1]) if cov else None}
         sites[octet] = entry
         if not seeds:
             flagged = any(d["is_seed"] for d in members)
@@ -428,7 +435,7 @@ def calculate(events, devices, match, window_start, window_end, now, settings=No
             piece = (g["start"], g["end"])
             site_outages.append(piece)
             rec, raw = _record("site", octet, None, g["parts"], piece, now_utc, cov, core, planned_iv, planned_list)
-            if raw["total"] > 0 or (cov and piece[0] < cov[1] and piece[1] > cov[0]):
+            if raw["total"] > 0 or (cov and _intersect([piece], cov)):
                 entry["outages"].append(rec)
                 total = _add_buckets(total, raw)
         entry["down"] = _round_buckets(_add_buckets(total, {}))
@@ -448,12 +455,14 @@ def calculate(events, devices, match, window_start, window_end, now, settings=No
                         continue
                     parts = _clip_parts(g["parts"], piece)
                     rec, raw = _record("device", octet, dev, parts, piece, now_utc, cov, core, planned_iv, planned_list)
-                    if cov and piece[0] < cov[1] and piece[1] > cov[0]:
+                    if cov and _intersect([piece], cov):
                         entry["device_outages"].append(rec)
 
     return {"sites": sites, "notes": notes, "settings": cfg,
-            "coverage": {"from": local_from_utc(cov[0]) if cov else None,
-                         "to": local_from_utc(cov[1]) if cov else None, "core_minutes": round(core_total, 2)}}
+            "coverage": {"from": local_from_utc(cov[0][0]) if cov else None,
+                         "to": local_from_utc(cov[-1][1]) if cov else None,
+                         "spans": [(local_from_utc(a), local_from_utc(b)) for a, b in cov],
+                         "core_minutes": round(core_total, 2)}}
 
 
 def describe_parts(rec):
