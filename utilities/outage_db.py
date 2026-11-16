@@ -11,6 +11,10 @@ Tables
   orion_events  every node Down/Up event pulled, keyed by Orion's own EventID so
                 pulling the same event twice never makes a duplicate
   orion_pulls   one row per pull: when, what period it covered, what it fetched
+  outage_windows / outage_window_sites
+                planned downtime windows (all sites, or a list of site octets),
+                entered by hand. Deleting one is soft, so it can be restored.
+                `kind` is 'planned' today; manual outage entries will share the table.
 
 Also here: the site `tier` (0 = most important ... 3 = least; 4 = sites that go offline often because of their own operations), a nullable
 column on sites. NULL means "not tiered yet".
@@ -25,6 +29,8 @@ keys on purpose: SAD hard-deletes devices when merging duplicates, and history
 must survive that. A node that stops matching keeps its last known device_id; a
 node that matches a different device later takes the new one.
 """
+from datetime import datetime
+
 import db
 import orion_parser as op
 
@@ -62,6 +68,28 @@ CREATE TABLE IF NOT EXISTS orion_pulls (
     nodes_fetched  INTEGER NOT NULL,
     nodes_matched  INTEGER NOT NULL,
     note           TEXT
+);
+
+CREATE TABLE IF NOT EXISTS outage_windows (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    kind       TEXT NOT NULL DEFAULT 'planned',
+    all_sites  INTEGER NOT NULL DEFAULT 0,
+    start_time TEXT NOT NULL,
+    end_time   TEXT NOT NULL,
+    reason     TEXT,
+    source     TEXT NOT NULL DEFAULT 'manual',
+    created_by TEXT,
+    created_at TEXT NOT NULL,
+    changed_by TEXT,
+    changed_at TEXT,
+    deleted_at TEXT,
+    deleted_by TEXT
+);
+
+CREATE TABLE IF NOT EXISTS outage_window_sites (
+    window_id  INTEGER NOT NULL,
+    site_octet TEXT NOT NULL,
+    PRIMARY KEY (window_id, site_octet)
 );
 
 CREATE INDEX IF NOT EXISTS idx_orion_events_node ON orion_events(node_id, event_id);
@@ -291,3 +319,137 @@ def event_counts(conn) -> dict:
             "up": one(f"SELECT COUNT(*) FROM orion_events WHERE event_type = {op.EVENT_UP}"),
             "nodes": one("SELECT COUNT(*) FROM orion_nodes"),
             "nodes_matched": one("SELECT COUNT(*) FROM orion_nodes WHERE device_id IS NOT NULL")}
+
+
+# ---------------------------------------------------------------------
+# Planned downtime windows (times are Eastern wall-clock, like the events)
+# ---------------------------------------------------------------------
+
+WINDOW_KINDS = ("planned",)
+WINDOW_SOURCES = ("manual", "from_outage")
+MAX_WINDOW_DAYS = 366
+MAX_REASON_CHARS = 300
+
+
+def _window_time(value, label):
+    if isinstance(value, datetime):
+        return value.replace(microsecond=0)
+    try:
+        return op.parse_time(value).replace(microsecond=0)
+    except Exception:
+        raise ValueError(f"{label} is not a usable date and time: {value!r}") from None
+
+
+def _clean_reason(reason):
+    text = " ".join(str(reason or "").split())
+    if len(text) > MAX_REASON_CHARS:
+        raise ValueError(f"reason is {len(text)} characters; the limit is {MAX_REASON_CHARS}")
+    return text or None
+
+
+def validate_window(sites, start, end, reason=None):
+    """Check a planned window and return (sites, start, end, reason) cleaned up:
+    sites is None for "every site" or a sorted list of site octets (text), start and
+    end are datetimes. Raises ValueError with a plain reason. Call it BEFORE queueing."""
+    if sites is not None:
+        if isinstance(sites, str):
+            sites = [x for x in sites.replace(" ", "").split(",") if x]
+        sites = sorted({str(x).strip() for x in sites if str(x).strip()})
+        if not sites:
+            raise ValueError("pick at least one site, or all sites")
+    start, end = _window_time(start, "start"), _window_time(end, "end")
+    if end <= start:
+        raise ValueError(f"the window must end after it starts ({start} to {end})")
+    if (end - start).days > MAX_WINDOW_DAYS:
+        raise ValueError(f"a window longer than {MAX_WINDOW_DAYS} days is probably a typo ({start} to {end})")
+    return sites, start, end, _clean_reason(reason)
+
+
+def _live_octets(conn):
+    return {r["site_octet"] for r in conn.execute("SELECT site_octet FROM sites WHERE deleted_at IS NULL")}
+
+
+def _window_row(conn, window_id):
+    row = conn.execute("SELECT * FROM outage_windows WHERE id = ?", (int(window_id),)).fetchone()
+    if row is None:
+        raise ValueError(f"there is no planned window number {window_id}")
+    return row
+
+
+def _site_label(sites):
+    return "all sites" if sites is None else "site " + ", ".join(sites)
+
+
+def add_planned_window(conn, sites, start, end, reason=None, source="manual") -> int:
+    """Add a planned downtime window. `sites` is None for every site or a list of
+    site octets. Returns the new window's id."""
+    sites, start, end, reason = validate_window(sites, start, end, reason)
+    if source not in WINDOW_SOURCES:
+        raise ValueError(f"source must be one of {WINDOW_SOURCES}")
+    if sites is not None:
+        live = _live_octets(conn)
+        unknown = [x for x in sites if x not in live]
+        if unknown:
+            raise ValueError("no such site: " + ", ".join(unknown))
+    cur = conn.execute(
+        "INSERT INTO outage_windows (kind, all_sites, start_time, end_time, reason, source, created_by, created_at) "
+        "VALUES ('planned', ?, ?, ?, ?, ?, ?, ?)",
+        (1 if sites is None else 0, fmt_time(start), fmt_time(end), reason, source, getattr(db, "CURRENT_USER", None), db._now()))
+    window_id = cur.lastrowid
+    for octet in sites or []:
+        conn.execute("INSERT INTO outage_window_sites (window_id, site_octet) VALUES (?, ?)", (window_id, octet))
+    db.log_activity("add_planned_window", f"Planned window {window_id}: {_site_label(sites)}, {fmt_time(start)} to {fmt_time(end)}"
+                    + (f" ({reason})" if reason else ""), conn=conn)
+    return window_id
+
+
+def update_planned_window(conn, window_id, start=None, end=None, reason=None) -> bool:
+    """Change a window's start, end or reason (None leaves a value alone; an empty
+    reason clears it). Used to trim a window. Returns True if anything changed."""
+    row = _window_row(conn, window_id)
+    if row["deleted_at"]:
+        raise ValueError(f"planned window {window_id} is deleted; restore it first")
+    new_start = _window_time(start, "start") if start is not None else op.parse_time(row["start_time"])
+    new_end = _window_time(end, "end") if end is not None else op.parse_time(row["end_time"])
+    new_reason = _clean_reason(reason) if reason is not None else row["reason"]
+    _sites, new_start, new_end, _r = validate_window(["x"], new_start, new_end)
+    if fmt_time(new_start) == row["start_time"] and fmt_time(new_end) == row["end_time"] and new_reason == row["reason"]:
+        return False
+    conn.execute("UPDATE outage_windows SET start_time = ?, end_time = ?, reason = ?, changed_by = ?, changed_at = ? WHERE id = ?",
+                 (fmt_time(new_start), fmt_time(new_end), new_reason, getattr(db, "CURRENT_USER", None), db._now(), int(window_id)))
+    db.log_activity("update_planned_window", f"Planned window {window_id} now {fmt_time(new_start)} to {fmt_time(new_end)}", conn=conn)
+    return True
+
+
+def delete_planned_window(conn, window_id) -> None:
+    """Soft-delete a window. It stops counting everywhere and can be restored."""
+    row = _window_row(conn, window_id)
+    if row["deleted_at"]:
+        raise ValueError(f"planned window {window_id} is already deleted")
+    conn.execute("UPDATE outage_windows SET deleted_at = ?, deleted_by = ? WHERE id = ?",
+                 (db._now(), getattr(db, "CURRENT_USER", None), int(window_id)))
+    db.log_activity("delete_planned_window", f"Planned window {window_id} deleted", conn=conn)
+
+
+def restore_planned_window(conn, window_id) -> None:
+    row = _window_row(conn, window_id)
+    if not row["deleted_at"]:
+        raise ValueError(f"planned window {window_id} is not deleted")
+    conn.execute("UPDATE outage_windows SET deleted_at = NULL, deleted_by = NULL WHERE id = ?", (int(window_id),))
+    db.log_activity("restore_planned_window", f"Planned window {window_id} restored", conn=conn)
+
+
+def load_planned_windows(conn, include_deleted: bool = False):
+    """Planned windows as the dicts outage_calc expects (id, sites, start, end, deleted)
+    plus reason, source, created_by, created_at. `sites` is None for all sites."""
+    out = []
+    sql = "SELECT * FROM outage_windows WHERE kind = 'planned'" + ("" if include_deleted else " AND deleted_at IS NULL") + " ORDER BY start_time, id"
+    for r in conn.execute(sql):
+        sites = None
+        if not r["all_sites"]:
+            sites = [x["site_octet"] for x in conn.execute(
+                "SELECT site_octet FROM outage_window_sites WHERE window_id = ? ORDER BY site_octet", (r["id"],))]
+        out.append({"id": r["id"], "sites": sites, "start": op.parse_time(r["start_time"]), "end": op.parse_time(r["end_time"]),
+                    "deleted": bool(r["deleted_at"]), "reason": r["reason"], "source": r["source"],
+                    "created_by": r["created_by"], "created_at": r["created_at"]})
+    return out

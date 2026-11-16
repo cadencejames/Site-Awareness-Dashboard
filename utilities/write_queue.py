@@ -177,6 +177,10 @@ ACTIONS = {
     "set_site_tier": outage_db.set_site_tier,
     "set_site_tiers": outage_db.set_site_tiers,
     "store_orion_pull": outage_db.store_orion_pull,
+    "add_planned_window": outage_db.add_planned_window,
+    "update_planned_window": outage_db.update_planned_window,
+    "delete_planned_window": outage_db.delete_planned_window,
+    "restore_planned_window": outage_db.restore_planned_window,
 }
 
 

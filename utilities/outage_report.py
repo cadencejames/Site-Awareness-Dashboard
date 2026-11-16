@@ -9,6 +9,7 @@ build_sheets() turns that into the sheets of the Excel workbook (or the CSV file
   By tier         the same, averaged per tier
   Outage detail   every site outage, with how merged outages were built
   Device outages  outages of other devices at a site (they do not affect availability)
+  Planned windows the planned downtime windows that touch the month
   Settings used   the thresholds, core hours, period covered, and what was left out
 
 Settings come from the "outage" section of settings.json (all optional):
@@ -153,6 +154,8 @@ def compute_month(conn, year, month, settings=None, planned=None):
     now = op.parse_time(pull["server_now"])
     coverage = outage_db.coverage(conn)
     devices = om.load_sad_devices(conn)
+    if planned is None:
+        planned = outage_db.load_planned_windows(conn)
     calc = outage_calc.calculate(outage_db.load_events(conn), devices, outage_db.load_matches(conn), start, end, now,
                                  settings=cfg, planned=planned, coverage=coverage)
     tiers = {s["site_octet"]: s["tier"] for s in db.get_all_sites(conn, include_unassigned=False)}
@@ -173,7 +176,8 @@ def compute_month(conn, year, month, settings=None, planned=None):
     if notes["ambiguous_hour_events"]:
         warnings.append(f"{notes['ambiguous_hour_events']} event(s) fall in the hour that repeats when daylight saving ends and could not be placed with certainty.")
     return {"year": year, "month": month, "window": (start, end), "settings": cfg, "calc": calc, "tiers": tiers,
-            "devices": {d["device_id"]: d for d in devices}, "last_pull": pull, "coverage": coverage, "warnings": warnings}
+            "devices": {d["device_id"]: d for d in devices}, "last_pull": pull, "coverage": coverage, "warnings": warnings,
+            "planned": [w for w in planned if not w.get("deleted")]}
 
 
 # ---------------------------------------------------------------------------
@@ -267,6 +271,20 @@ def build_sheets(report):
                          o["total"], o["core_unplanned"], o["core_planned"], o["outside_unplanned"], o["outside_planned"],
                          outage_calc.describe_parts(o)])
 
+    month_start, month_end = report["window"]
+    touching = [w for w in report["planned"] if w["start"] < month_end and w["end"] > month_start]
+    used = {}
+    for site_entry in sites.values():
+        for o in site_entry["outages"] + site_entry["device_outages"]:
+            for pid in o["planned_ids"]:
+                used[pid] = used.get(pid, 0) + 1
+    planned_rows = [["ID", "Sites", "Start", "End", "Length (min)", "Reason", "How it was entered", "Entered by", "Entered (UTC)", "Outages it overlaps"]]
+    for w in touching:
+        planned_rows.append([w["id"], "All sites" if w["sites"] is None else ", ".join(w["sites"]), w["start"], w["end"],
+                             round((w["end"] - w["start"]).total_seconds() / 60.0, 2), w["reason"] or "",
+                             "marked on an outage" if w["source"] == "from_outage" else "entered by hand",
+                             w["created_by"] or "", w["created_at"] or "", used.get(w["id"], 0)])
+
     cfg, notes, pull = report["settings"], calc["notes"], report["last_pull"]
     start, end = report["window"]
     hhmm = lambda m: f"{m // 60:02d}:{m % 60:02d}"
@@ -287,7 +305,7 @@ def build_sheets(report):
                      ["Up events with no Down before them (ignored)", notes["stray_up"]],
                      ["Down events while already down (ignored)", notes["repeated_down"]],
                      ["Outages that began before the data starts", len(notes["before_data"])],
-                     ["Planned downtime", "none applied; availability with and without it is the same"],
+                     ["Planned downtime", f"{len(touching)} window(s) touch this month" if touching else "none this month; availability with and without it is the same"],
                      ["Generated (UTC)", datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M")]]
     for w in report["warnings"]:
         settings_rows.append(["Warning", w])
@@ -297,5 +315,6 @@ def build_sheets(report):
         {"name": "By tier", "rows": by_tier, "widths": [20, 10, 12, 18, 18, 14, 9, 14, 14]},
         {"name": "Outage detail", "rows": detail, "widths": [8, 24, 6, 17, 17, 12, 14, 14, 14, 16, 16, 34, 16], "filter": True},
         {"name": "Device outages", "rows": devs, "widths": [8, 24, 24, 17, 17, 12, 14, 14, 14, 16, 16, 34], "filter": True},
+        {"name": "Planned windows", "rows": planned_rows, "widths": [6, 24, 17, 17, 12, 40, 18, 14, 20, 12], "filter": True},
         {"name": "Settings used", "rows": settings_rows, "widths": [58, 60]},
     ]
