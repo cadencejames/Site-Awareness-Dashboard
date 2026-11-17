@@ -130,6 +130,210 @@ class WindowDialog(tk.Toplevel):
             self.destroy()
 
 
+TIER_CHOICES = ("No tier", "Tier 0 - most important", "Tier 1", "Tier 2", "Tier 3 - least important",
+                "Tier 4 - offline often (own operations)")
+
+
+def _tier_from_choice(text):
+    """Combobox text -> None or 0-4."""
+    return None if text == TIER_CHOICES[0] else TIER_CHOICES.index(text) - 1
+
+
+def _tier_label(tier):
+    return "-" if tier is None else str(tier)
+
+
+def _save_tiers(site_ids, tier):
+    """Check, then queue the change. Returns None when saved, else a plain-text problem."""
+    try:
+        tier = outage_db.validate_tier(tier)
+    except ValueError as e:
+        return str(e)
+    try:
+        if len(site_ids) == 1:
+            write_queue.queue_and_wait("set_site_tier", timeout=30, site_id=int(site_ids[0]), tier=tier)
+        else:
+            write_queue.queue_and_wait("set_site_tiers", timeout=30, site_ids=[int(i) for i in site_ids], tier=tier)
+    except (RuntimeError, TimeoutError, ValueError) as e:
+        return f"Saving failed: {str(e)[:200]}"
+    return None
+
+
+class TierControls(ttk.Frame):
+    """A tier dropdown for the Site manager's Actions area. Choosing a value saves it
+    straight away. Also holds the button that opens the several-sites dialog.
+    The Site manager calls set_site(site) when a site is picked and set_enabled(False)
+    when none is."""
+
+    def __init__(self, parent, on_changed=None):
+        super().__init__(parent)
+        self._on_changed = on_changed
+        self._site = None
+        self._quiet = False
+        ttk.Label(self, text="Tier:").grid(row=0, column=0, sticky="w")
+        self.var = tk.StringVar(value=TIER_CHOICES[0])
+        self.box = ttk.Combobox(self, textvariable=self.var, values=TIER_CHOICES, state="disabled", width=34)
+        self.box.grid(row=0, column=1, sticky="w", padx=(6, 10))
+        self.box.bind("<<ComboboxSelected>>", self._on_pick)
+        self.bulk_button = ttk.Button(self, text="Set tier for several sites...", command=self._open_bulk)
+        self.bulk_button.grid(row=0, column=2, sticky="w")
+
+    def set_site(self, site):
+        self._site = site
+        usable = site is not None and site["site_octet"] != db.UNASSIGNED_SITE_OCTET
+        self._quiet = True
+        self.var.set(TIER_CHOICES[0] if site is None or site["tier"] is None else TIER_CHOICES[int(site["tier"]) + 1])
+        self._quiet = False
+        self.box.configure(state="readonly" if usable else "disabled")
+
+    def set_enabled(self, enabled):
+        if not enabled:
+            self._site = None
+            self.box.configure(state="disabled")
+
+    def _on_pick(self, event=None):
+        if self._quiet or self._site is None:
+            return
+        tier = _tier_from_choice(self.var.get())
+        if tier == self._site["tier"]:
+            return
+        problem = _save_tiers([self._site["id"]], tier)
+        if problem:
+            messagebox.showerror("Set tier", problem)
+            self.set_site(self._site)
+            return
+        if self._on_changed:
+            self._on_changed()
+
+    def _open_bulk(self):
+        BulkTierDialog(self, self._on_changed)
+
+
+class BulkTierDialog(tk.Toplevel):
+    """Pick several sites and give them all one tier (or none)."""
+
+    def __init__(self, parent, on_changed=None):
+        super().__init__(parent)
+        self.title("Set tier for several sites")
+        self.transient(parent.winfo_toplevel())
+        self._on_changed = on_changed
+        self._sites = []          # every site: dict(id, octet, name, tier)
+        self._shown = []          # the ones passing the filter, in list order
+        self._selected = set()    # ids picked, kept while the filter changes
+        self.columnconfigure(0, weight=1)
+        self.rowconfigure(1, weight=1)
+
+        top = ttk.Frame(self, padding=(10, 10, 10, 0))
+        top.grid(row=0, column=0, sticky="ew")
+        top.columnconfigure(1, weight=1)
+        ttk.Label(top, text="Filter:").grid(row=0, column=0, sticky="w")
+        self.filter_var = tk.StringVar()
+        entry = ttk.Entry(top, textvariable=self.filter_var)
+        entry.grid(row=0, column=1, sticky="ew", padx=(6, 0))
+        self.filter_var.trace_add("write", lambda *a: self._fill())
+
+        mid = ttk.Frame(self, padding=(10, 6, 10, 0))
+        mid.grid(row=1, column=0, sticky="nsew")
+        mid.rowconfigure(0, weight=1)
+        mid.columnconfigure(0, weight=1)
+        self.listbox = tk.Listbox(mid, selectmode="extended", height=16, width=56, exportselection=False,
+                                  font=("Consolas", 10))
+        self.listbox.grid(row=0, column=0, sticky="nsew")
+        scroll = ttk.Scrollbar(mid, orient="vertical", command=self.listbox.yview)
+        scroll.grid(row=0, column=1, sticky="ns")
+        self.listbox.configure(yscrollcommand=scroll.set)
+        self.listbox.bind("<<ListboxSelect>>", self._on_select)
+
+        picks = ttk.Frame(self, padding=(10, 6, 10, 0))
+        picks.grid(row=2, column=0, sticky="ew")
+        ttk.Button(picks, text="Select all shown", command=self._select_shown).pack(side="left")
+        ttk.Button(picks, text="Select shown with no tier", command=self._select_untiered).pack(side="left", padx=(6, 0))
+        ttk.Button(picks, text="Clear selection", command=self._clear).pack(side="left", padx=(6, 0))
+        self.count_label = ttk.Label(picks, text="")
+        self.count_label.pack(side="right")
+
+        bottom = ttk.Frame(self, padding=10)
+        bottom.grid(row=3, column=0, sticky="ew")
+        ttk.Label(bottom, text="Give them:").pack(side="left")
+        self.tier_var = tk.StringVar(value=TIER_CHOICES[2])
+        ttk.Combobox(bottom, textvariable=self.tier_var, values=TIER_CHOICES, state="readonly", width=34).pack(side="left", padx=(6, 10))
+        self.apply_button = ttk.Button(bottom, text="Apply", command=self._apply)
+        self.apply_button.pack(side="left")
+        ttk.Button(bottom, text="Close", command=self.destroy).pack(side="right")
+        self.message = ttk.Label(self, text="", padding=(10, 0, 10, 8), foreground="#1b5e20")
+        self.message.grid(row=4, column=0, sticky="w")
+
+        self._load()
+        self.bind("<Escape>", lambda e: self.destroy())
+        self.grab_set()
+        entry.focus_set()
+
+    def _load(self):
+        with db.get_conn() as conn:
+            rows = db.get_all_sites(conn, include_unassigned=False)
+        self._sites = [{"id": r["id"], "octet": r["site_octet"], "name": r["site_name"] or "(unset)", "tier": r["tier"]}
+                       for r in rows]
+        self._fill()
+
+    def _fill(self):
+        needle = self.filter_var.get().strip().lower()
+        self._shown = [s for s in self._sites if not needle or needle in s["octet"].lower() or needle in s["name"].lower()]
+        self.listbox.delete(0, "end")
+        for s in self._shown:
+            self.listbox.insert("end", f"{s['octet']:>8}  {s['name'][:30]:<30}  tier {_tier_label(s['tier'])}")
+        for i, s in enumerate(self._shown):
+            if s["id"] in self._selected:
+                self.listbox.selection_set(i)
+        self._update_count()
+
+    def _on_select(self, event=None):
+        picked = set(self.listbox.curselection())
+        for i, s in enumerate(self._shown):
+            if i in picked:
+                self._selected.add(s["id"])
+            else:
+                self._selected.discard(s["id"])
+        self._update_count()
+
+    def _update_count(self):
+        self.count_label.configure(text=f"{len(self._selected)} selected, {len(self._shown)} shown")
+
+    def _select_shown(self):
+        self.listbox.selection_set(0, "end")
+        self._on_select()
+
+    def _select_untiered(self):
+        self.listbox.selection_clear(0, "end")
+        for i, s in enumerate(self._shown):
+            if s["tier"] is None:
+                self.listbox.selection_set(i)
+        self._on_select()
+
+    def _clear(self):
+        self.listbox.selection_clear(0, "end")
+        self._selected.clear()
+        self._update_count()
+
+    def _apply(self):
+        ids = sorted(self._selected)
+        if not ids:
+            self.message.configure(text="Pick at least one site first.", foreground="#c62828")
+            return
+        tier = _tier_from_choice(self.tier_var.get())
+        what = "no tier" if tier is None else f"tier {tier}"
+        if not messagebox.askyesno("Set tier", f"Set {len(ids)} site(s) to {what}?", parent=self):
+            return
+        problem = _save_tiers(ids, tier)
+        if problem:
+            self.message.configure(text=problem, foreground="#c62828")
+            return
+        self.message.configure(text=f"{len(ids)} site(s) set to {what}.", foreground="#1b5e20")
+        self._selected.clear()
+        self._load()
+        if self._on_changed:
+            self._on_changed()
+
+
 class OutageTab(ttk.Frame):
     def __init__(self, parent, creds):
         super().__init__(parent)

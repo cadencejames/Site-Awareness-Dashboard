@@ -548,19 +548,22 @@ class SiteManagerTab(ttk.Frame):
 
         ttk.Label(left, text="Sites").grid(row=0, column=0, sticky="w")
 
-        self.site_tree = ttk.Treeview(left, columns=("octet", "name", "code"), show="headings", selectmode="browse")
+        self.site_tree = ttk.Treeview(left, columns=("octet", "name", "code", "tier"), show="headings", selectmode="browse")
         self.site_tree.heading("octet", text="Octet")
         self.site_tree.heading("name", text="Name")
         self.site_tree.heading("code", text="Code")
+        self.site_tree.heading("tier", text="Tier")
         self.site_tree.column("octet", width=60, anchor="w")
         self.site_tree.column("name", width=140, anchor="w")
         self.site_tree.column("code", width=70, anchor="w")
+        self.site_tree.column("tier", width=45, anchor="w")
         self.site_tree.grid(row=1, column=0, sticky="nsew", pady=(4, 4))
         self.site_tree.bind("<<TreeviewSelect>>", self._on_site_selected)
         self._enable_sorting(self.site_tree, {
             "octet": self._sort_key_int_prefix,
             "name": self._sort_key_str,
             "code": self._sort_key_str,
+            "tier": self._sort_key_str,
         })
 
         site_scroll = ttk.Scrollbar(left, orient="vertical", command=self.site_tree.yview)
@@ -608,6 +611,9 @@ class SiteManagerTab(ttk.Frame):
 
         self.btn_arp_override = ttk.Button(actions_frame, text="Set ARP override IP", command=self._set_arp_override_ip, state="disabled")
         self.btn_arp_override.grid(row=1, column=1, sticky="ew", padx=(4, 0))
+
+        self.tier_controls = outage_tab.TierControls(actions_frame, on_changed=self.refresh_sites)
+        self.tier_controls.grid(row=2, column=0, columnspan=2, sticky="w", pady=(8, 0))
 
         devices_header = ttk.Frame(right)
         devices_header.grid(row=2, column=0, sticky="ew")
@@ -673,6 +679,7 @@ class SiteManagerTab(ttk.Frame):
                 site["site_octet"],
                 site["site_name"] or "(unset)",
                 site["site_code"] or "-",
+                "-" if site["tier"] is None else site["tier"],
             ))
             self._sites_by_iid[iid] = site
         if previously_selected_id is not None and str(previously_selected_id) in self._sites_by_iid:
@@ -696,6 +703,7 @@ class SiteManagerTab(ttk.Frame):
         label = site["site_name"] or site["site_octet"]
         self.actions_label.config(text=f"Actions - {label} ({site['site_octet']})")
         self._set_actions_enabled(True)
+        self.tier_controls.set_site(site)
         # "Unassigned" is a reserved site used for cross-site link
         # attribution - never offer it as a deletable target, or a
         # future CDP walk that lands an unattributed neighbor there
@@ -705,6 +713,7 @@ class SiteManagerTab(ttk.Frame):
         self.refresh_devices()
 
     def _set_actions_enabled(self, enabled: bool):
+        self.tier_controls.set_enabled(enabled)
         state = "normal" if enabled else "disabled"
         for btn in (self.btn_identity, self.btn_seed, self.btn_arp_seed, self.btn_arp_override, self.btn_add_device):
             btn.config(state=state)
