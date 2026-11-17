@@ -30,6 +30,7 @@ import site_map_svg  # noqa: E402
 import mac_parser  # noqa: E402
 import banner  # noqa: E402
 import kg_pages  # noqa: E402
+import outage_pages  # noqa: E402
 
 OUTPUT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "dashboard")
 
@@ -723,6 +724,12 @@ def render_site_page(conn, site_row) -> str:
         kg_panel_html = f'<div class="panel"><div class="panel-head"><span class="label">KG Devices</span></div><p style="padding:12px 14px;font-family:var(--mono);font-size:12px">KG panel could not be built: {_esc(e)}</p></div>'
     kg_css = kg_pages.CSS if kg_panel_html else ""
     kg_js = kg_pages.JS if kg_panel_html else ""
+    try:
+        outage_panel_html = outage_pages.render_site_panel(conn, site_row)
+    except Exception as e:   # never let an outage problem stop a site page
+        outage_panel_html = f'<div class="panel"><div class="panel-head"><span class="label">Outages</span></div><p style="padding:12px 14px;font-family:var(--mono);font-size:12px">Outages panel could not be built: {_esc(e)}</p></div>'
+    outage_css = outage_pages.PANEL_CSS if outage_panel_html else ""
+    outage_js = outage_pages.PANEL_JS if outage_panel_html else ""
     arp_rows = db.get_arp_for_site(conn, site_id)
     client_rows = db.get_clients_for_site(conn, site_id)
     tunnel_interface_rows = db.get_tunnel_interfaces_for_site(conn, site_id)
@@ -858,6 +865,7 @@ tr:last-child td{{ border-bottom:none; }}
 tr:hover td{{ background:var(--panel-2); }}
 footer{{ margin-top:20px; font-family:var(--mono); font-size:11px; color:var(--text-dim); text-align:center; }}
 {kg_css}
+{outage_css}
 {banner.CSS}
 </style>
 </head>
@@ -894,6 +902,8 @@ footer{{ margin-top:20px; font-family:var(--mono); font-size:11px; color:var(--t
     <div>{render_tunnels_html(tunnel_interface_rows, tunnel_link_rows, site_row["last_tunnel_collection"])}</div>
   </details>
 
+  {outage_panel_html}
+
   {kg_panel_html}
 
   <details class="panel">
@@ -909,6 +919,7 @@ function toggleExpand(id){{
   el.hidden = !el.hidden;
 }}
 {kg_js}
+{outage_js}
 {THEME_TOGGLE_JS}
 </script>
 </body>
@@ -945,6 +956,7 @@ def render_index_page(conn) -> str:
                             f'<div class="label">KG devices &middot; {kg_label}</div></center></a>')
     except Exception:
         pass
+    outage_button_html, outage_tile_html = outage_pages.render_index_bits(conn)
 
     unassigned_count = 0
     if unassigned_site is not None:
@@ -1060,6 +1072,7 @@ footer{{ margin-top:20px; font-family:var(--mono); font-size:11px; color:var(--t
       <a class="btn" href="exports.html">Exports</a>
       <a class="btn" href="configs.html">Configs</a>
       {kg_button_html}
+      {outage_button_html}
       <a class="btn" href="site-unassigned.html">Unassigned ({unassigned_count})</a>
       <button class="icon-btn" id="theme-toggle" title="Toggle theme">\U0001F319</button>
     </div>
@@ -1072,6 +1085,7 @@ footer{{ margin-top:20px; font-family:var(--mono); font-size:11px; color:var(--t
     <div class="kpi"><center><div class="num">{total_clients}</div><div class="label">Clients</div></center></div>
     <div class="kpi"><center>{'<div class="num warn">' if never_scanned > 0 else '<div class="num">'}{never_scanned}</div><div class="label">Never CDP-scanned</div></center></div>
     {kg_tile_html}
+    {outage_tile_html}
     <a class="kpi kpi-link" href="stale.html" title="Review stale devices"><center><div class="num warn">{stale_device_count}</div><div class="label">Stale devices</div></center></a>
   </div>
 
@@ -2078,6 +2092,8 @@ def generate_all(db_path: str = None):
         kg_path = kg_pages.generate_kg_page(conn)
         if kg_path:
             print(f"  Wrote {kg_path}")
+        for outage_path in outage_pages.generate_outage_pages(conn):
+            print(f"  Wrote {outage_path}")
         # Re-derived from every site's own links/tunnel_links each
         # time, same as the index page and client search - not
         # incrementally updatable, so it's always fully regenerated
@@ -2105,6 +2121,8 @@ def generate_one(site_key: str, db_path: str = None):
         kg_path = kg_pages.generate_kg_page(conn)
         if kg_path:
             print(f"  Wrote {kg_path}")
+        for outage_path in outage_pages.generate_outage_pages(conn):
+            print(f"  Wrote {outage_path}")
         # This one site's own cross-site links/tunnels can change the
         # all-site map too (a new inter-site edge, a newly-matched
         # tunnel) - regenerated alongside the index for the same
