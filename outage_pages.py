@@ -502,6 +502,21 @@ def _tier_groups(rep):
     return groups
 
 
+def _summarise(entries):
+    avail = [e["availability_all"] for e in entries if e["availability_all"] is not None]
+    excl = [e["availability_excl_planned"] for e in entries if e["availability_excl_planned"] is not None]
+    return {"sites": len(entries), "outages": sum(len(e["outages"]) for e in entries),
+            "avg_all": sum(avail) / len(avail) if avail else None,
+            "avg_excl_planned": sum(excl) / len(excl) if excl else None}
+
+
+def _tier_summaries(groups):
+    """{tier: figures, ..., "all": figures}. Keyed by the tier number, so it never depends on tier names."""
+    out = {tier: _summarise([e for _, e in members]) for tier, members in groups.items()}
+    out["all"] = _summarise([e for members in groups.values() for _, e in members])
+    return out
+
+
 def _row_html(octet, entry, tier, th):
     lv_all = level(entry["availability_all"], tier, th)
     lv_ex = level(entry["availability_excl_planned"], tier, th)
@@ -531,8 +546,8 @@ def render_fleet_page(conn, ym):
     rep = reports[ym]
     meta = _meta(rep)
     groups = _tier_groups(rep)
-    summaries = {s["label"]: s for s in rpt.tier_summary(rep)}
-    overall = summaries["All tracked sites"]
+    summaries = _tier_summaries(groups)
+    overall = summaries["all"]
     ongoing = sum(1 for _, e in (x for g in groups.values() for x in g) for o in e["outages"] if o["ongoing"])
     tracked = overall["sites"]
 
@@ -564,7 +579,7 @@ def render_fleet_page(conn, ym):
     card_order = [t for t in sorted(t for t in groups if t is not None)] + [None]
     cards = []
     for tier in card_order:
-        s = summaries.get(_tier_text(tier))
+        s = summaries.get(tier)
         empty = s is None
         lv = "none" if empty else level(s["avg_all"], tier, th)
         cards.append(
@@ -579,7 +594,7 @@ def render_fleet_page(conn, ym):
     for tier in card_order:
         if tier not in groups:
             continue
-        s = summaries[_tier_text(tier)]
+        s = summaries[tier]
         members = sorted(groups[tier], key=lambda m: rpt._site_sort_key(m[0]))
         with_outage = [m for m in members if m[1]["outages"]]
         lv = level(s["avg_all"], tier, th)
@@ -638,7 +653,7 @@ button:hover, .btn:hover{{ border-color:var(--accent); }}
 .icon-btn{{ width:38px; height:38px; padding:0; display:flex; align-items:center; justify-content:center; font-size:16px; }}
 .header-actions{{ display:flex; gap:8px; align-items:center; }}
 .kpi-grid{{ display:flex; flex-wrap:wrap; justify-content:center; gap:12px; margin-bottom:20px; }}
-.kpi{{ flex:0 1 220px; background:var(--panel); border:1px solid var(--border); border-radius:var(--radius); padding:14px 16px; text-align:center; }}
+.kpi{{ flex:0 1 220px; background:var(--panel); border:1px solid var(--border); border-radius:var(--radius); padding:14px 16px; text-align:center; display:flex; flex-direction:column; justify-content:center; }}
 .kpi .num{{ font-family:var(--mono); font-size:26px; font-weight:700; font-variant-numeric:tabular-nums; }}
 .kpi .num.warn{{ color:var(--warn); }} .kpi .num.amber{{ color:var(--accent); }}
 .kpi .label{{ font-family:var(--mono); font-size:11px; text-transform:uppercase; letter-spacing:.07em; color:var(--text-dim); margin-top:4px; }}
@@ -732,12 +747,13 @@ def generate_outage_pages(conn):
         return []
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     paths = _write_snapshots(data)
-    for ym, rep in data["months"]:
-        key = _meta(rep)["key"]
-        path = os.path.join(OUTPUT_DIR, f"outages-{key}.html")
-        _write_text(path, render_fleet_page(conn, ym))
+    pages = [(f"outages-{_meta(rep)['key']}.html", ym) for ym, rep in data["months"]]
+    pages.append(("outages.html", data["months"][0][0]))
+    for name, ym in pages:
+        path = os.path.join(OUTPUT_DIR, name)
+        try:
+            _write_text(path, render_fleet_page(conn, ym))
+        except Exception as exc:
+            raise RuntimeError(f"could not build {name}: {type(exc).__name__}: {exc}") from exc
         paths.append(path)
-    newest = os.path.join(OUTPUT_DIR, "outages.html")
-    _write_text(newest, render_fleet_page(conn, data["months"][0][0]))
-    paths.append(newest)
     return paths

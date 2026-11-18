@@ -428,7 +428,7 @@ button{{ background:var(--panel-2); border:1px solid var(--border); border-radiu
 button:hover{{ border-color:var(--accent); }}
 .icon-btn{{ width:38px; height:38px; padding:0; display:flex; align-items:center; justify-content:center; font-size:16px; }}
 .kpi-grid{{ display:flex; flex-wrap:wrap; justify-content:center; gap:12px; margin-bottom:20px; }}
-.kpi{{ flex:0 1 190px; background:var(--panel); border:1px solid var(--border); border-radius:var(--radius); padding:14px 16px; text-align:center; }}
+.kpi{{ flex:0 1 190px; background:var(--panel); border:1px solid var(--border); border-radius:var(--radius); padding:14px 16px; text-align:center; display:flex; flex-direction:column; justify-content:center; }}
 .kpi .num{{ font-family:var(--mono); font-size:26px; font-weight:700; }}
 .kpi .num.warn{{ color:var(--warn); }} .kpi .num.amber{{ color:var(--accent); }}
 .kpi .label{{ font-family:var(--mono); font-size:11px; text-transform:uppercase; letter-spacing:.07em; color:var(--text-dim); margin-top:4px; }}

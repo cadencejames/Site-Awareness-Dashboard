@@ -39,6 +39,7 @@ CSS_TOKENS = """
   --bg: #0b0f14; --panel: #121821; --panel-2: #182130; --border: #24303f;
   --text: #dbe4ee; --text-dim: #7c8a9a; --accent: #e8a33d; --accent-dim: #7a5a26;
   --up: #3ddc84; --warn: #e85d5d; --radius: 10px;
+  --wrap-max: max(1200px, 75vw);
   --mono: 'JetBrains Mono', 'SFMono-Regular', Consolas, monospace;
   --sans: 'Segoe UI', Tahoma, Arial, sans-serif;
 }
@@ -780,7 +781,7 @@ def render_site_page(conn, site_row) -> str:
 {CSS_TOKENS}
 *{{ box-sizing: border-box; }}
 body{{ margin:0; background:var(--bg); color:var(--text); font-family:var(--sans); -webkit-font-smoothing:antialiased; }}
-.wrap{{ max-width:1200px; margin:0 auto; padding:24px 24px 60px; }}
+.wrap{{ max-width:var(--wrap-max); margin:0 auto; padding:24px 24px 60px; }}
 .backlink{{ display:inline-block; font-family:var(--mono); font-size:12px; color:var(--text-dim); border:1px solid var(--border); border-radius:999px; padding:5px 12px; text-decoration:none; margin-bottom:14px; }}
 .backlink:hover{{ color:var(--accent); border-color:var(--accent); }}
 header{{ display:flex; justify-content:space-between; align-items:flex-end; border-bottom:2px solid var(--border); padding-bottom:16px; margin-bottom:20px; gap:16px; flex-wrap:wrap; }}
@@ -1017,21 +1018,21 @@ def render_index_page(conn) -> str:
 {CSS_TOKENS}
 *{{ box-sizing: border-box; }}
 body{{ margin:0; background:var(--bg); color:var(--text); font-family:var(--sans); -webkit-font-smoothing:antialiased; }}
-.wrap{{ max-width:1200px; margin:0 auto; padding:24px 24px 60px; }}
+.wrap{{ max-width:var(--wrap-max); margin:0 auto; padding:24px 24px 60px; }}
 header{{ display:flex; justify-content:space-between; align-items:flex-end; border-bottom:2px solid var(--border); padding-bottom:16px; margin-bottom:20px; gap:16px; flex-wrap:wrap; }}
 header h1{{ margin:0; font-size:22px; font-weight:700; }}
 .subtitle{{ font-family:var(--mono); font-size:12px; color:var(--text-dim); margin-top:4px; }}
-.header-actions{{ display:flex; gap:8px; align-items:center; }}
+.header-actions{{ display:flex; gap:8px; align-items:center; flex:1 1 0; min-width:360px; flex-wrap:wrap; justify-content:flex-end; }}
 button, .btn{{ background:var(--panel-2); border:1px solid var(--border); border-radius:8px; color:var(--text); font-family:var(--sans); font-size:13px; padding:8px 14px; cursor:pointer; transition:border-color .15s ease, transform .1s ease; text-decoration:none; display:inline-block; }}
 button:hover, .btn:hover{{ border-color:var(--accent); }}
 button:active, .btn:active{{ transform:scale(.97); }}
 .icon-btn{{ width:38px; height:38px; padding:0; display:flex; align-items:center; justify-content:center; font-size:16px; }}
 .kpi-grid{{ display:grid; grid-template-columns:repeat(auto-fit, minmax(120px,1fr)); gap:10px; margin-bottom:24px; }}
-.kpi{{ background:var(--panel); border:1px solid var(--border); border-radius:var(--radius); padding:12px 10px; }}
+.kpi{{ background:var(--panel); border:1px solid var(--border); border-radius:var(--radius); padding:12px 10px; display:flex; flex-direction:column; justify-content:center; }}
 .kpi .num{{ font-family:var(--mono); font-size:24px; font-weight:700; }}
 .kpi .num.warn{{ color:var(--warn); }}
 .kpi .label{{ font-family:var(--mono); font-size:11px; text-transform:uppercase; letter-spacing:.07em; color:var(--text-dim); margin-top:4px; }}
-.kpi-link{{ display:block; color:inherit; text-decoration:none; transition:border-color .15s ease; }}
+.kpi-link{{ display:flex; flex-direction:column; justify-content:center; color:inherit; text-decoration:none; transition:border-color .15s ease; }}
 .kpi-link:hover{{ border-color:var(--accent); }}
 .search-row{{ margin-bottom:14px; }}
 #search{{ width:100%; background:var(--panel); border:1px solid var(--border); border-radius:8px; color:var(--text); font-family:var(--mono); font-size:13px; padding:10px 14px; }}
@@ -1295,7 +1296,7 @@ def render_stale_page(conn) -> str:
 {CSS_TOKENS}
 *{{ box-sizing: border-box; }}
 body{{ margin:0; background:var(--bg); color:var(--text); font-family:var(--sans); -webkit-font-smoothing:antialiased; }}
-.wrap{{ max-width:1200px; margin:0 auto; padding:24px 24px 60px; }}
+.wrap{{ max-width:var(--wrap-max); margin:0 auto; padding:24px 24px 60px; }}
 a{{ color:inherit; }}
 .backlink{{ display:inline-block; font-family:var(--mono); font-size:12px; color:var(--text-dim); border:1px solid var(--border); border-radius:999px; padding:5px 12px; text-decoration:none; margin-bottom:14px; }}
 .backlink:hover{{ color:var(--accent); border-color:var(--accent); }}
