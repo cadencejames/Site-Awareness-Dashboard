@@ -275,7 +275,7 @@ table.ou-t td{ padding:7px 10px; border-top:1px solid var(--border); }
 table.ou-t th.r, table.ou-t td.r{ text-align:right; }
 table.ou-t tr:hover td{ background:var(--panel-2); }
 .ou-pill{ font-family:var(--mono); font-size:10.5px; border-radius:999px; padding:2px 9px; border:1px solid var(--border); white-space:nowrap; }
-.ou-pill.bad{ color:var(--warn); border-color:var(--warn); } .ou-pill.warn{ color:var(--accent); border-color:var(--accent); } .ou-pill.plan{ color:#5aa9e6; border-color:#5aa9e6; }
+.ou-pill.bad{ color:var(--warn); border-color:var(--warn); } .ou-pill.warn{ color:var(--accent); border-color:var(--accent); } .ou-pill.plan{ color:#5aa9e6; border-color:#5aa9e6; } .ou-pill.out{ color:var(--text-dim); }
 .ou-sub{ font-family:var(--mono); font-size:10.5px; text-transform:uppercase; letter-spacing:.06em; color:var(--text-dim); margin:0 0 6px; }
 .ou-list{ display:flex; flex-direction:column; gap:6px; }
 .ou-item{ display:flex; flex-wrap:wrap; justify-content:space-between; gap:4px 12px; font-family:var(--mono); font-size:12px; padding:7px 12px; border:1px solid var(--border); border-radius:8px; background:var(--panel-2); }
@@ -471,9 +471,9 @@ def render_index_bits(conn):
 # ---------------------------------------------------------------------------
 
 FLEET_CSS = """
-.ou-bar{ display:flex; flex-wrap:wrap; gap:10px 14px; align-items:center; justify-content:space-between; margin-bottom:14px; }
-.ou-bar select{ background:var(--panel); border:1px solid var(--border); border-radius:8px; color:var(--text); font-family:var(--mono); font-size:13px; padding:8px 12px; }
-.ou-bar label{ font-family:var(--mono); font-size:12px; color:var(--text-dim); margin-right:8px; }
+.ou-pick{ display:flex; align-items:center; }
+.ou-pick select{ background:var(--panel); border:1px solid var(--border); border-radius:8px; color:var(--text); font-family:var(--mono); font-size:13px; padding:8px 12px; }
+.ou-pick label{ font-family:var(--mono); font-size:12px; color:var(--text-dim); margin-right:8px; }
 .ou-notice{ border:1px solid var(--accent-dim); background:var(--panel-2); border-radius:8px; padding:9px 14px; font-family:var(--mono); font-size:12px; color:var(--accent); margin-bottom:10px; }
 .ou-strip-tiers{ display:flex; flex-wrap:wrap; gap:10px; margin-bottom:18px; }
 .ou-tcard{ flex:1 1 150px; min-width:0; background:var(--panel); border:1px solid var(--border); border-radius:var(--radius); padding:11px 14px; display:flex; flex-direction:column; gap:3px; }
@@ -528,11 +528,15 @@ def _row_html(octet, entry, tier, th):
         pill = '<span class="ou-pill plan">planned only</span>'
     elif lv_all == "bad":
         pill = '<span class="ou-pill bad">below target</span>'
+    elif entry["outages"] and down["core_unplanned"] == 0 and down["core_planned"] == 0:
+        pill = '<span class="ou-pill out">outside core hours</span>'
     else:
         pill = ""
+    outside = down["outside_unplanned"] + down["outside_planned"]
     name = _esc(entry["site_name"] or f"Site {octet}")
     return (f'<tr><td><a href="site-{_esc(octet)}.html">{_esc(octet)}</a></td><td>{name}</td><td class="r">{len(entry["outages"])}</td>'
             f'<td class="r">{_mins(down["core_unplanned"])} min</td><td class="r" style="color:#5aa9e6">{_mins(down["core_planned"])} min</td>'
+            f'<td class="r ou-none">{_mins(outside)} min</td>'
             f'<td class="r {_cls(lv_all)}"><b>{_pct(entry["availability_all"])}</b></td>'
             f'<td class="r {_cls(lv_ex)}"><b>{_pct(entry["availability_excl_planned"])}</b></td><td>{pill}</td></tr>')
 
@@ -576,7 +580,7 @@ def render_fleet_page(conn, ym):
     ]
     kpi_html = "".join(f'<div class="kpi"><div class="{c}">{v}</div><div class="label">{l}</div></div>' for v, c, l in kpis)
 
-    card_order = [t for t in sorted(t for t in groups if t is not None)] + [None]
+    card_order = sorted(t for t in groups if t is not None) + ([None] if None in groups else [])
     cards = []
     for tier in card_order:
         s = summaries.get(tier)
@@ -602,7 +606,7 @@ def render_fleet_page(conn, ym):
         note_html = f'<span class="ou-gnote">{_esc(note)}</span>' if note else ""
         body = "".join(_row_html(o, e, tier, th) for o, e in with_outage)
         table = (f'<div class="ou-scroll"><table class="ou-t"><thead><tr><th>Site</th><th>Name</th><th class="r">Outages</th>'
-                 f'<th class="r">Core unplanned</th><th class="r">Core planned</th><th class="r">All downtime</th>'
+                 f'<th class="r">Core unplanned</th><th class="r">Core planned</th><th class="r">Outside core</th><th class="r">All downtime</th>'
                  f'<th class="r">Planned excluded</th><th>Status</th></tr></thead><tbody>{body}</tbody></table></div>'
                  if with_outage else '<p class="ou-note" style="padding:12px 14px">No outages in this group this month.</p>')
         clean = s["sites"] - len(with_outage)
@@ -673,14 +677,12 @@ footer{{ margin-top:20px; font-family:var(--mono); font-size:11px; color:var(--t
       <div class="subtitle">{_esc(meta["label"])} &middot; last Orion pull {_esc(pulled)} &middot; generated {generated_at}</div>
     </div>
     <div class="header-actions">
+      <span class="ou-pick"><label for="month-pick">Month</label><select id="month-pick">{options}</select></span>
       {excel}
       <button class="icon-btn" id="theme-toggle" title="Toggle theme">\U0001F319</button>
     </div>
   </header>
 
-  <div class="ou-bar">
-    <span><label for="month-pick">Month</label><select id="month-pick">{options}</select></span>
-  </div>
   {notice_html}
   <div class="kpi-grid">{kpi_html}</div>
   <div class="ou-strip-tiers">{"".join(cards)}</div>
