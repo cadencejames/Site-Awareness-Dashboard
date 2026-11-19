@@ -92,11 +92,12 @@ def export_phone_vtc_inventory(conn, include_phones: bool = True, include_vtcs: 
             "serial_number": (enrichment["serial_number"] if enrichment else None) or "",
             "phone_number": (enrichment["phone_number"] if enrichment else None) or "",
             "ris_status": (enrichment["ris_status"] if enrichment else None) or "",
+            "description": (enrichment["description"] if enrichment else None) or "",
         })
 
     path = os.path.join(EXPORTS_DIR, "phones_vtc_inventory.csv")
     fieldnames = ["mac", "type", "site", "switch", "interface", "vlan",
-                  "model", "serial_number", "phone_number", "ris_status"]
+                  "model", "serial_number", "phone_number", "ris_status", "description"]
     _write_csv(path, fieldnames, rows)
 
     scope = "phones+VTCs" if include_phones and include_vtcs else ("phones only" if include_phones else "VTCs only")

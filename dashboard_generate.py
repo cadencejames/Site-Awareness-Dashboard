@@ -472,7 +472,7 @@ def render_clients_html(client_rows, devices_by_id, arp_rows, site_last_mac_tabl
             badges.append('<span class="badge stale">stale</span>')
 
         has_expand = enrichment is not None and any(
-            [enrichment["phone_number"], enrichment["serial_number"], enrichment["ris_status"], enrichment["ris_ip"]]
+            [enrichment["description"], enrichment["phone_number"], enrichment["serial_number"], enrichment["ris_status"], enrichment["ris_ip"]]
         )
         panel_id = f"client-{norm_mac}"
         row_attrs = f' onclick="toggleExpand(\'{panel_id}\')" style="cursor:pointer;"' if has_expand else ""
@@ -492,6 +492,7 @@ def render_clients_html(client_rows, devices_by_id, arp_rows, site_last_mac_tabl
             row_html += f'''
     <div id="{panel_id}" class="remote-list" hidden>
       <div class="remote-list-title">CUCM / RIS Details</div>
+      <div class="enrich-row"><span>Description</span><span>{_esc(enrichment["description"] or "-")}</span></div>
       <div class="enrich-row"><span>Phone number(s)</span><span>{_esc(enrichment["phone_number"] or "-")}</span></div>
       <div class="enrich-row"><span>Serial</span><span>{_esc(enrichment["serial_number"] or "-")}</span></div>
       <div class="enrich-row"><span>RIS status</span><span>{_esc(enrichment["ris_status"] or "-")}</span></div>
@@ -1731,6 +1732,7 @@ def _gather_all_clients_for_search(conn):
                 "risStatus": (enrichment["ris_status"] if enrichment else None) or "",
                 "risIp": (enrichment["ris_ip"] if enrichment else None) or "",
                 "phoneNumber": (enrichment["phone_number"] if enrichment else None) or "",
+                "description": (enrichment["description"] if enrichment else None) or "",
                 "stale": _client_is_stale(c, site["last_mac_table_collection"]),
             })
     return results
@@ -1849,7 +1851,7 @@ function macHtml(client, query) {{
 function matchesClient(client, query) {{
   const q = query.toLowerCase();
   const fields = ["mac", "site", "siteName", "switch", "iface", "vlan", "ip",
-                  "model", "serial", "risStatus", "risIp", "phoneNumber"];
+                  "model", "serial", "risStatus", "risIp", "phoneNumber", "description"];
   for (const f of fields) {{
     if (String(client[f] || "").toLowerCase().includes(q)) return true;
   }}
@@ -1868,7 +1870,7 @@ function renderRow(client, query) {{
   }}
   if (client.stale) badges += '<span class="badge stale">stale</span>';
 
-  const hasExpand = client.serial || client.risStatus || client.risIp || client.phoneNumber;
+  const hasExpand = client.serial || client.risStatus || client.risIp || client.phoneNumber || client.description;
   const panelId = "search-" + client.site + "-" + normalizeMac(client.mac);
   const mainAttrs = hasExpand ? ' onclick="toggleExpand(\\'' + panelId + '\\')" style="cursor:pointer;"' : "";
 
@@ -1890,6 +1892,7 @@ function renderRow(client, query) {{
   if (hasExpand) {{
     html += '<div id="' + panelId + '" class="remote-list" hidden>'
       + '<div class="remote-list-title">CUCM / RIS Details</div>'
+      + '<div class="enrich-row"><span>Description</span><span>' + escapeHtml(client.description || "-") + '</span></div>'
       + '<div class="enrich-row"><span>Phone number(s)</span><span>' + escapeHtml(client.phoneNumber || "-") + '</span></div>'
       + '<div class="enrich-row"><span>Serial</span><span>' + escapeHtml(client.serial || "-") + '</span></div>'
       + '<div class="enrich-row"><span>RIS status</span><span>' + escapeHtml(client.risStatus || "-") + '</span></div>'

@@ -27,7 +27,14 @@ and 'vtc' (local admin login used for each VTC's own xAPI). Add both
 via credential_manager.py's (A)dd option if you haven't already -
 each just needs a username and a password field.
 
-Configuration: set CUCM_HOST below before running.
+The 'cucm' account also needs the "Standard AXL API Access" role: one
+bulk AXL query per run (see _fetch_axl_descriptions()) reads CUCM's
+Description field for every phone/VTC and stores it alongside the RIS
+data. RIS itself has no description field. If AXL fails (no role, wrong
+AXL_VERSION, CUCM unreachable) the run says so and carries on without
+touching any description already stored.
+
+Configuration: set CUCM_HOST (and, if needed, AXL_VERSION) below before running.
 """
 
 import os
@@ -51,6 +58,12 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 # CONFIG
 # ---------------------------------------------------------------------
 CUCM_HOST = "cucm-publisher.example.com"  # <-- set your CUCM Publisher hostname or IP here
+
+AXL_VERSION = "12.5"                      # AXL schema version to ask for; set it to your CUCM's major.minor (e.g. "14.0")
+AXL_PAGE_SIZE = 500                       # phones per listPhone call (AXL refuses a single answer of more than 1000 rows)
+AXL_PACE_DELAY = 1.0                      # seconds between AXL pages, to stay well under CUCM's AXL throttle
+AXL_THROTTLE_WAIT = 30                    # seconds to wait before retrying a throttled (HTTP 503) page
+AXL_THROTTLE_TRIES = 3
 
 RIS_BATCH_SIZE = 500                      # devices per RIS call (Cisco-documented safe max)
 RIS_NAMESPACE = {"ns1": "http://schemas.cisco.com/ast/soap"}
@@ -210,6 +223,100 @@ def _query_ris_batch(session, cucm_host, auth, device_names):
 
 
 # ---------------------------------------------------------------------
+# AXL (CUCM's configuration API) - the Description field. RIS cannot
+# return it. One bulk, paged listPhone for every SEP device, matched to
+# SAD's phones/VTCs by device name afterwards.
+# ---------------------------------------------------------------------
+class AxlError(Exception):
+    """AXL could not be read; the message is meant to be shown as is."""
+
+
+def _local(tag):
+    """Element name without its {namespace} part."""
+    return tag.rsplit("}", 1)[-1] if isinstance(tag, str) else ""
+
+
+def _build_axl_request(first, skip):
+    return f"""<soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/" xmlns:ns="http://www.cisco.com/AXL/API/{AXL_VERSION}">
+  <soapenv:Header/>
+  <soapenv:Body>
+    <ns:listPhone>
+      <searchCriteria><name>SEP%</name></searchCriteria>
+      <returnedTags><name/><description/></returnedTags>
+      <skip>{skip}</skip>
+      <first>{first}</first>
+    </ns:listPhone>
+  </soapenv:Body>
+</soapenv:Envelope>"""
+
+
+def _parse_axl_page(xml_text):
+    """Returns (descriptions, row_count): device name (uppercase) ->
+    description or None. Raises AxlError on a SOAP fault."""
+    try:
+        root = ET.fromstring(xml_text)
+    except ET.ParseError as e:
+        raise AxlError(f"AXL answered with something that is not XML ({e}).") from None
+    for el in root.iter():
+        if _local(el.tag) == "faultstring":
+            raise AxlError(f"AXL returned a fault: {(el.text or '').strip()[:300]}")
+    out, rows = {}, 0
+    for phone in root.iter():
+        if _local(phone.tag) != "phone":
+            continue
+        rows += 1
+        name = description = None
+        for child in phone:
+            if _local(child.tag) == "name":
+                name = (child.text or "").strip()
+            elif _local(child.tag) == "description":
+                description = (child.text or "").strip() or None
+        if name:
+            out[name.upper()] = description
+    return out, rows
+
+
+def _post_axl_page(session, cucm_host, auth, first, skip):
+    url = f"https://{cucm_host}:8443/axl/"
+    headers = {"Content-Type": "text/xml; charset=utf-8", "SOAPAction": f'"CUCM:DB ver={AXL_VERSION}"'}
+    body = _build_axl_request(first, skip)
+    for attempt in range(1, AXL_THROTTLE_TRIES + 1):
+        resp = session.post(url, data=body, headers=headers, auth=auth, verify=VERIFY_TLS, timeout=60)
+        if resp.status_code == 503 and attempt < AXL_THROTTLE_TRIES:
+            print(f"    AXL is throttling; waiting {AXL_THROTTLE_WAIT}s (try {attempt}/{AXL_THROTTLE_TRIES})...")
+            time.sleep(AXL_THROTTLE_WAIT)
+            continue
+        break
+    if resp.status_code in (401, 403):
+        raise AxlError(f"AXL refused the 'cucm' login (HTTP {resp.status_code}). The account needs the "
+                       f"'Standard AXL API Access' role, and the username/password must be right.")
+    if resp.status_code == 503:
+        raise AxlError("AXL is still throttling after several tries; run again in a few minutes.")
+    if resp.status_code >= 400 and "faultstring" not in resp.text:
+        raise AxlError(f"AXL returned HTTP {resp.status_code}.")
+    return _parse_axl_page(resp.text)
+
+
+def _fetch_axl_descriptions(session, cucm_host, auth):
+    """Every SEP device's Description, as {NAME: description or None}.
+    Raises AxlError (clear message) when the whole list cannot be read;
+    a partial list is never returned, so the caller can trust that a
+    device missing from the result is really not in CUCM."""
+    result, skip = {}, 0
+    while True:
+        try:
+            page, rows = _post_axl_page(session, cucm_host, auth, AXL_PAGE_SIZE, skip)
+        except requests.exceptions.RequestException as e:
+            raise AxlError(f"Could not reach AXL on {cucm_host}: {e}") from None
+        result.update(page)
+        print(f"  AXL page: {rows} phone(s) (running total {len(result)})")
+        if rows < AXL_PAGE_SIZE:
+            return result
+        skip += AXL_PAGE_SIZE
+        time.sleep(AXL_PACE_DELAY)
+
+
+# ---------------------------------------------------------------------
 # Per-device HTTP/xAPI (ported from the proven, real script)
 # ---------------------------------------------------------------------
 def _get_serial_from_phone(ip, timeout=DEVICE_HTTP_TIMEOUT):
@@ -283,10 +390,13 @@ def _pull_serial_and_model(client, ip, vtc_username, vtc_password):
 # ---------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------
-def main():
+def run(creds):
+    """The whole enrichment pass, given an already-unlocked credential
+    dict (the GUI's Discovery tab passes the one it unlocked at login;
+    main() below gets one from credential_loader for command-line use).
+    Raises ValueError if the 'cucm' or 'vtc' credential is missing."""
     print("=== SAD CUCM/VTC Enrichment ===\n")
 
-    creds = credential_loader.prompt_and_load()
     cucm_username, cucm_password = _get_credential(creds, "cucm")
     vtc_username, vtc_password = _get_credential(creds, "vtc")
     cucm_auth = HTTPBasicAuth(cucm_username, cucm_password)
@@ -323,6 +433,24 @@ def main():
                 conn, client["mac"], name, info.get("ip"), info.get("status"),
                 phone_number=info.get("phone_number"),
             )
+        # Commit after each phase so this run never holds sad.db's write
+        # lock through the slow network steps below (the GUI and its
+        # write queue share the same database file).
+        conn.commit()
+
+        # --- Step 1b: AXL bulk query for CUCM's Description - every run, no skipping ---
+        print("\nQuerying AXL for device descriptions...")
+        try:
+            axl_results = _fetch_axl_descriptions(session, CUCM_HOST, cucm_auth)
+        except AxlError as e:
+            axl_results = None
+            print(f"  WARNING: descriptions were not updated this run. {e}")
+        if axl_results is not None:
+            wanted = {client["mac"]: axl_results.get(name) for name, client in by_device_name.items()}
+            changed = db.set_phone_descriptions(conn, wanted)
+            found = sum(1 for name in by_device_name if axl_results.get(name))
+            print(f"AXL had a description for {found} / {len(by_device_name)} device(s); {changed} changed.")
+        conn.commit()
 
         # --- Step 2: per-device serial/model pull - skip anything already attempted ---
         existing_by_mac = {row["mac"]: row for row in db.get_all_phone_enrichment(conn)}
@@ -359,6 +487,10 @@ def main():
     print(f"  New serial numbers found this run:  {got_serial}")
     print(f"  Still missing (unreachable/legacy): {len(results) - got_serial}")
     print(f"  Skipped (already attempted before): {skipped}")
+
+
+def main():
+    run(credential_loader.prompt_and_load())
 
 
 if __name__ == "__main__":
