@@ -30,6 +30,7 @@ import site_map_svg  # noqa: E402
 import mac_parser  # noqa: E402
 import banner  # noqa: E402
 import kg_pages  # noqa: E402
+import outage_pages  # noqa: E402
 
 OUTPUT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "dashboard")
 
@@ -38,6 +39,7 @@ CSS_TOKENS = """
   --bg: #0b0f14; --panel: #121821; --panel-2: #182130; --border: #24303f;
   --text: #dbe4ee; --text-dim: #7c8a9a; --accent: #e8a33d; --accent-dim: #7a5a26;
   --up: #3ddc84; --warn: #e85d5d; --radius: 10px;
+  --wrap-max: max(1200px, 75vw);
   --mono: 'JetBrains Mono', 'SFMono-Regular', Consolas, monospace;
   --sans: 'Segoe UI', Tahoma, Arial, sans-serif;
 }
@@ -724,6 +726,12 @@ def render_site_page(conn, site_row) -> str:
         kg_panel_html = f'<div class="panel"><div class="panel-head"><span class="label">KG Devices</span></div><p style="padding:12px 14px;font-family:var(--mono);font-size:12px">KG panel could not be built: {_esc(e)}</p></div>'
     kg_css = kg_pages.CSS if kg_panel_html else ""
     kg_js = kg_pages.JS if kg_panel_html else ""
+    try:
+        outage_panel_html = outage_pages.render_site_panel(conn, site_row)
+    except Exception as e:   # never let an outage problem stop a site page
+        outage_panel_html = f'<div class="panel"><div class="panel-head"><span class="label">Outages</span></div><p style="padding:12px 14px;font-family:var(--mono);font-size:12px">Outages panel could not be built: {_esc(e)}</p></div>'
+    outage_css = outage_pages.PANEL_CSS if outage_panel_html else ""
+    outage_js = outage_pages.PANEL_JS if outage_panel_html else ""
     arp_rows = db.get_arp_for_site(conn, site_id)
     client_rows = db.get_clients_for_site(conn, site_id)
     tunnel_interface_rows = db.get_tunnel_interfaces_for_site(conn, site_id)
@@ -774,7 +782,7 @@ def render_site_page(conn, site_row) -> str:
 {CSS_TOKENS}
 *{{ box-sizing: border-box; }}
 body{{ margin:0; background:var(--bg); color:var(--text); font-family:var(--sans); -webkit-font-smoothing:antialiased; }}
-.wrap{{ max-width:1200px; margin:0 auto; padding:24px 24px 60px; }}
+.wrap{{ max-width:var(--wrap-max); margin:0 auto; padding:24px 24px 60px; }}
 .backlink{{ display:inline-block; font-family:var(--mono); font-size:12px; color:var(--text-dim); border:1px solid var(--border); border-radius:999px; padding:5px 12px; text-decoration:none; margin-bottom:14px; }}
 .backlink:hover{{ color:var(--accent); border-color:var(--accent); }}
 header{{ display:flex; justify-content:space-between; align-items:flex-end; border-bottom:2px solid var(--border); padding-bottom:16px; margin-bottom:20px; gap:16px; flex-wrap:wrap; }}
@@ -859,6 +867,7 @@ tr:last-child td{{ border-bottom:none; }}
 tr:hover td{{ background:var(--panel-2); }}
 footer{{ margin-top:20px; font-family:var(--mono); font-size:11px; color:var(--text-dim); text-align:center; }}
 {kg_css}
+{outage_css}
 {banner.CSS}
 </style>
 </head>
@@ -895,6 +904,8 @@ footer{{ margin-top:20px; font-family:var(--mono); font-size:11px; color:var(--t
     <div>{render_tunnels_html(tunnel_interface_rows, tunnel_link_rows, site_row["last_tunnel_collection"])}</div>
   </details>
 
+  {outage_panel_html}
+
   {kg_panel_html}
 
   <details class="panel">
@@ -910,6 +921,7 @@ function toggleExpand(id){{
   el.hidden = !el.hidden;
 }}
 {kg_js}
+{outage_js}
 {THEME_TOGGLE_JS}
 </script>
 </body>
@@ -946,6 +958,7 @@ def render_index_page(conn) -> str:
                             f'<div class="label">KG devices &middot; {kg_label}</div></center></a>')
     except Exception:
         pass
+    outage_button_html, outage_tile_html = outage_pages.render_index_bits(conn)
 
     unassigned_count = 0
     if unassigned_site is not None:
@@ -1006,21 +1019,21 @@ def render_index_page(conn) -> str:
 {CSS_TOKENS}
 *{{ box-sizing: border-box; }}
 body{{ margin:0; background:var(--bg); color:var(--text); font-family:var(--sans); -webkit-font-smoothing:antialiased; }}
-.wrap{{ max-width:1200px; margin:0 auto; padding:24px 24px 60px; }}
+.wrap{{ max-width:var(--wrap-max); margin:0 auto; padding:24px 24px 60px; }}
 header{{ display:flex; justify-content:space-between; align-items:flex-end; border-bottom:2px solid var(--border); padding-bottom:16px; margin-bottom:20px; gap:16px; flex-wrap:wrap; }}
 header h1{{ margin:0; font-size:22px; font-weight:700; }}
 .subtitle{{ font-family:var(--mono); font-size:12px; color:var(--text-dim); margin-top:4px; }}
-.header-actions{{ display:flex; gap:8px; align-items:center; }}
+.header-actions{{ display:flex; gap:8px; align-items:center; flex:1 1 0; min-width:360px; flex-wrap:wrap; justify-content:flex-end; }}
 button, .btn{{ background:var(--panel-2); border:1px solid var(--border); border-radius:8px; color:var(--text); font-family:var(--sans); font-size:13px; padding:8px 14px; cursor:pointer; transition:border-color .15s ease, transform .1s ease; text-decoration:none; display:inline-block; }}
 button:hover, .btn:hover{{ border-color:var(--accent); }}
 button:active, .btn:active{{ transform:scale(.97); }}
 .icon-btn{{ width:38px; height:38px; padding:0; display:flex; align-items:center; justify-content:center; font-size:16px; }}
 .kpi-grid{{ display:grid; grid-template-columns:repeat(auto-fit, minmax(120px,1fr)); gap:10px; margin-bottom:24px; }}
-.kpi{{ background:var(--panel); border:1px solid var(--border); border-radius:var(--radius); padding:12px 10px; }}
+.kpi{{ background:var(--panel); border:1px solid var(--border); border-radius:var(--radius); padding:12px 10px; display:flex; flex-direction:column; justify-content:center; }}
 .kpi .num{{ font-family:var(--mono); font-size:24px; font-weight:700; }}
 .kpi .num.warn{{ color:var(--warn); }}
 .kpi .label{{ font-family:var(--mono); font-size:11px; text-transform:uppercase; letter-spacing:.07em; color:var(--text-dim); margin-top:4px; }}
-.kpi-link{{ display:block; color:inherit; text-decoration:none; transition:border-color .15s ease; }}
+.kpi-link{{ display:flex; flex-direction:column; justify-content:center; color:inherit; text-decoration:none; transition:border-color .15s ease; }}
 .kpi-link:hover{{ border-color:var(--accent); }}
 .search-row{{ margin-bottom:14px; }}
 #search{{ width:100%; background:var(--panel); border:1px solid var(--border); border-radius:8px; color:var(--text); font-family:var(--mono); font-size:13px; padding:10px 14px; }}
@@ -1061,6 +1074,7 @@ footer{{ margin-top:20px; font-family:var(--mono); font-size:11px; color:var(--t
       <a class="btn" href="exports.html">Exports</a>
       <a class="btn" href="configs.html">Configs</a>
       {kg_button_html}
+      {outage_button_html}
       <a class="btn" href="site-unassigned.html">Unassigned ({unassigned_count})</a>
       <button class="icon-btn" id="theme-toggle" title="Toggle theme">\U0001F319</button>
     </div>
@@ -1073,6 +1087,7 @@ footer{{ margin-top:20px; font-family:var(--mono); font-size:11px; color:var(--t
     <div class="kpi"><center><div class="num">{total_clients}</div><div class="label">Clients</div></center></div>
     <div class="kpi"><center>{'<div class="num warn">' if never_scanned > 0 else '<div class="num">'}{never_scanned}</div><div class="label">Never CDP-scanned</div></center></div>
     {kg_tile_html}
+    {outage_tile_html}
     <a class="kpi kpi-link" href="stale.html" title="Review stale devices"><center><div class="num warn">{stale_device_count}</div><div class="label">Stale devices</div></center></a>
   </div>
 
@@ -1282,7 +1297,7 @@ def render_stale_page(conn) -> str:
 {CSS_TOKENS}
 *{{ box-sizing: border-box; }}
 body{{ margin:0; background:var(--bg); color:var(--text); font-family:var(--sans); -webkit-font-smoothing:antialiased; }}
-.wrap{{ max-width:1200px; margin:0 auto; padding:24px 24px 60px; }}
+.wrap{{ max-width:var(--wrap-max); margin:0 auto; padding:24px 24px 60px; }}
 a{{ color:inherit; }}
 .backlink{{ display:inline-block; font-family:var(--mono); font-size:12px; color:var(--text-dim); border:1px solid var(--border); border-radius:999px; padding:5px 12px; text-decoration:none; margin-bottom:14px; }}
 .backlink:hover{{ color:var(--accent); border-color:var(--accent); }}
@@ -2081,6 +2096,8 @@ def generate_all(db_path: str = None):
         kg_path = kg_pages.generate_kg_page(conn)
         if kg_path:
             print(f"  Wrote {kg_path}")
+        for outage_path in outage_pages.generate_outage_pages(conn):
+            print(f"  Wrote {outage_path}")
         # Re-derived from every site's own links/tunnel_links each
         # time, same as the index page and client search - not
         # incrementally updatable, so it's always fully regenerated
@@ -2108,6 +2125,8 @@ def generate_one(site_key: str, db_path: str = None):
         kg_path = kg_pages.generate_kg_page(conn)
         if kg_path:
             print(f"  Wrote {kg_path}")
+        for outage_path in outage_pages.generate_outage_pages(conn):
+            print(f"  Wrote {outage_path}")
         # This one site's own cross-site links/tunnels can change the
         # all-site map too (a new inter-site edge, a newly-matched
         # tunnel) - regenerated alongside the index for the same
