@@ -199,6 +199,7 @@ CREATE TABLE IF NOT EXISTS phone_enrichment (
     ris_ip         TEXT,
     ris_status     TEXT,
     phone_number   TEXT,  -- from RIS's DirNumber field (same bulk call as ris_ip/ris_status - refreshed every run, no skip logic, same reasoning as ris_status since an extension can genuinely be reassigned over time)
+    description    TEXT,  -- CUCM's own Description field for the device (from AXL, one bulk query per enrichment run; refreshed every run like phone_number since it is edited in CUCM)
     model          TEXT,
     serial_number  TEXT,
     last_attempted TEXT,
@@ -537,6 +538,7 @@ def init_db(db_path: str = DB_PATH) -> None:
         conn.executescript(SCHEMA)
         _ensure_column(conn, "sites", "last_mac_table_collection", "TEXT")
         _ensure_column(conn, "phone_enrichment", "phone_number", "TEXT")
+        _ensure_column(conn, "phone_enrichment", "description", "TEXT")
         # Soft-delete support: NULL = active, a real timestamp = hidden
         # from every listing/lookup below but still physically present
         # (reversible by design - see soft_delete_site()/
@@ -1698,6 +1700,25 @@ def upsert_phone_enrichment_status(conn, mac: str, device_name: str, ris_ip: str
         """,
         (mac, device_name, ris_ip, ris_status, phone_number),
     )
+
+
+def set_phone_descriptions(conn, descriptions: dict) -> int:
+    """Stores CUCM's Description for phone/VTC rows that already exist
+    in phone_enrichment (created first by upsert_phone_enrichment_status()
+    in the same run). `descriptions` maps a MAC (any format) to its
+    description text, or to None to clear it - cucm_enrich.py passes None
+    for a device that a COMPLETE AXL query did not find, since a device
+    deleted from CUCM no longer has a description. A MAC with no
+    enrichment row is ignored. Returns the number of rows changed.
+    """
+    changed = 0
+    for mac, text in descriptions.items():
+        cur = conn.execute(
+            "UPDATE phone_enrichment SET description = ? WHERE mac = ? AND description IS NOT ?",
+            (text, mac_parser.normalize_mac(mac), text),
+        )
+        changed += cur.rowcount
+    return changed
 
 
 def record_phone_serial_pull(conn, mac: str, model: str = None, serial_number: str = None) -> None:

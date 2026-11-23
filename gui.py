@@ -1570,6 +1570,8 @@ class DiscoveryTab(ttk.Frame):
                         command=self._on_action_changed).grid(row=1, column=4, sticky="w", pady=(8, 0))
         ttk.Radiobutton(controls, text="Collect configs", variable=self.action_var, value="configs",
                         command=self._on_action_changed).grid(row=1, column=5, sticky="w", pady=(8, 0))
+        ttk.Radiobutton(controls, text="Phone/VTC enrichment", variable=self.action_var, value="enrich",
+                        command=self._on_action_changed).grid(row=1, column=6, sticky="w", pady=(8, 0))
 
         self.collect_mac_var = tk.BooleanVar(value=False)
         self.collect_mac_check = ttk.Checkbutton(
@@ -1600,7 +1602,7 @@ class DiscoveryTab(ttk.Frame):
         self.config_stale_check.grid(row=4, column=1, columnspan=4, sticky="w", pady=(4, 0))
 
         self.run_button = ttk.Button(controls, text="Run", command=self._on_run_clicked)
-        self.run_button.grid(row=0, column=6, rowspan=2, sticky="ns", padx=(20, 0))
+        self.run_button.grid(row=0, column=7, rowspan=2, sticky="ns", padx=(20, 0))
 
         # Overall progress: how many of the sites in this run have
         # finished (successfully or not) - one determinate step per
@@ -1650,12 +1652,16 @@ class DiscoveryTab(ttk.Frame):
         self._on_action_changed()
 
     def _on_scope_changed(self):
-        self.site_combo.configure(state="readonly" if self.scope_var.get() == "site" else "disabled")
+        # Phone/VTC enrichment always covers every phone and VTC, so the
+        # site picker means nothing for it.
+        site_usable = self.scope_var.get() == "site" and self.action_var.get() != "enrich"
+        self.site_combo.configure(state="readonly" if site_usable else "disabled")
 
     def _on_action_changed(self):
         # MAC-table collection piggybacks on the CDP walk specifically
         # (see discover_site()'s collect_mac_tables option) - only
         # meaningful when CDP is actually part of what's about to run.
+        self._on_scope_changed()
         collect_mac_relevant = self.action_var.get() in ("cdp", "all")
         self.collect_mac_check.configure(state="normal" if collect_mac_relevant else "disabled")
 
@@ -1854,11 +1860,31 @@ class DiscoveryTab(ttk.Frame):
         if self._worker_thread is not None and self._worker_thread.is_alive():
             return  # defensive - the button should already be disabled during a run
 
-        if self.scope_var.get() == "site" and self.site_combo.current() < 0:
+        action = self.action_var.get()
+
+        if action != "enrich" and self.scope_var.get() == "site" and self.site_combo.current() < 0:
             messagebox.showwarning("Discovery", "Choose a site first, or select 'All sites'.")
             return
 
-        action = self.action_var.get()
+        if action == "enrich":
+            # Needs the 'cucm' and 'vtc' credentials, not 'tacacs'. Imported
+            # here so the GUI still starts if 'requests' is not installed.
+            try:
+                import cucm_enrich
+                cucm_enrich._get_credential(self._creds, "cucm")
+                cucm_enrich._get_credential(self._creds, "vtc")
+            except ImportError as e:
+                messagebox.showerror("Phone/VTC enrichment", f"Could not load cucm_enrich.py: {e}")
+                return
+            except ValueError as e:
+                messagebox.showerror("Credentials", str(e))
+                return
+            self._clear_console()
+            self._reset_progress_display()
+            self.run_button.configure(state="disabled")
+            self._worker_thread = threading.Thread(target=self._run_enrich_worker, daemon=True)
+            self._worker_thread.start()
+            return
 
         # Dashboard generation never touches the network - no reason to
         # validate credentials it doesn't need.
@@ -1889,6 +1915,19 @@ class DiscoveryTab(ttk.Frame):
 
         self._worker_thread = threading.Thread(target=worker_target, args=worker_args, daemon=True)
         self._worker_thread.start()
+
+    def _run_enrich_worker(self):
+        original_stdout = sys.stdout
+        sys.stdout = _QueueWriter(self._output_queue)
+        try:
+            import cucm_enrich
+            db.log_activity("cucm_enrich", "Phone/VTC enrichment (RIS + AXL descriptions)")
+            cucm_enrich.run(self._creds)
+        except Exception as e:
+            print(f"ERROR: {e}")
+        finally:
+            sys.stdout = original_stdout
+            self._output_queue.put(_DONE)
 
     def _run_dashboard_worker(self, site_id):
         original_stdout = sys.stdout
