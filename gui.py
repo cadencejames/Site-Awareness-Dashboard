@@ -1513,14 +1513,207 @@ class LoginDialog(tk.Toplevel):
         sys.exit(0)
 
 
+class SiteScopePanel(ttk.LabelFrame):
+    """Scope picker for the Discovery tab: "All sites" or "Selected
+    sites". Selected sites is a scrolling checklist (same look and
+    behaviour as the Command Runner's) with a filter box above it, Select
+    all / Clear links, a "N sites, N devices in scope" summary and a
+    refresh link. To run a single site, tick just that one.
+
+    The filter only hides rows - ticks on hidden sites are kept, and
+    Select all / Clear act on the rows currently showing.
+
+    site_ids() is what a caller reads: None means every site, otherwise
+    a list of the ticked site ids (empty if nothing is ticked yet).
+    set_enabled(False, note) grays out the whole panel, for actions
+    that ignore scope.
+    """
+
+    LINK_COLOR = "#1f4e8c"
+
+    def __init__(self, parent):
+        super().__init__(parent, text="Scope", padding=8)
+        self._site_info = []          # [{"id", "label", "devices"}] in site order
+        self._site_vars = {}          # site id -> BooleanVar
+        self._rows = {}               # site id -> (Checkbutton, device-count Label)
+        self._visible_ids = []        # ids the filter currently shows
+        self._enabled = True
+        self._disabled_note = ""
+
+        self.columnconfigure(0, weight=1)
+        self.rowconfigure(3, weight=1)
+        self.scope_var = tk.StringVar(value="all")
+
+        self.radio_all = ttk.Radiobutton(
+            self, text="All sites", variable=self.scope_var, value="all", command=self._apply_states)
+        self.radio_all.grid(row=0, column=0, sticky="w", pady=(0, 6))
+        self.radio_selected = ttk.Radiobutton(
+            self, text="Selected sites", variable=self.scope_var, value="selected", command=self._apply_states)
+        self.radio_selected.grid(row=1, column=0, sticky="w")
+
+        tools = ttk.Frame(self)
+        tools.grid(row=2, column=0, sticky="ew", padx=(18, 0), pady=(4, 2))
+        tools.columnconfigure(1, weight=1)
+        ttk.Label(tools, text="Filter").grid(row=0, column=0, sticky="w", padx=(0, 6))
+        self.filter_var = tk.StringVar()
+        self.filter_var.trace_add("write", lambda *a: self._apply_filter())
+        self.filter_entry = ttk.Entry(tools, textvariable=self.filter_var)
+        self.filter_entry.grid(row=0, column=1, sticky="ew")
+        link_row = ttk.Frame(tools)
+        link_row.grid(row=1, column=0, columnspan=2, sticky="w", pady=(4, 0))
+        self.select_all_link = tk.Label(link_row, text="Select all", fg=self.LINK_COLOR, cursor="hand2",
+                                        font=("Segoe UI", 9, "underline"))
+        self.select_all_link.pack(side="left")
+        self.select_all_link.bind("<Button-1>", lambda e: self._set_visible_checked(True))
+        self.clear_link = tk.Label(link_row, text="Clear", fg=self.LINK_COLOR, cursor="hand2",
+                                   font=("Segoe UI", 9, "underline"))
+        self.clear_link.pack(side="left", padx=(12, 0))
+        self.clear_link.bind("<Button-1>", lambda e: self._set_visible_checked(False))
+
+        check_outer = ttk.Frame(self)
+        check_outer.grid(row=3, column=0, sticky="nsew", padx=(18, 0))
+        check_outer.columnconfigure(0, weight=1)
+        check_outer.rowconfigure(0, weight=1)
+        self._check_canvas = tk.Canvas(check_outer, width=230, height=150, highlightthickness=1,
+                                       highlightbackground="#8a8a8a", background="#ffffff")
+        check_scroll = ttk.Scrollbar(check_outer, orient="vertical", command=self._check_canvas.yview)
+        self._check_canvas.configure(yscrollcommand=check_scroll.set)
+        self._check_canvas.grid(row=0, column=0, sticky="nsew")
+        check_scroll.grid(row=0, column=1, sticky="ns")
+        self._check_inner = ttk.Frame(self._check_canvas)
+        self._check_window = self._check_canvas.create_window((0, 0), window=self._check_inner, anchor="nw")
+        self._check_inner.bind(
+            "<Configure>", lambda e: self._check_canvas.configure(scrollregion=self._check_canvas.bbox("all")))
+        self._check_canvas.bind(
+            "<Configure>", lambda e: self._check_canvas.itemconfigure(self._check_window, width=e.width))
+        for widget in (self._check_canvas, self._check_inner):
+            self._bind_wheel(widget)
+
+        self.summary_label = ttk.Label(self, text="", foreground="#555555", wraplength=230, justify="left")
+        self.summary_label.grid(row=4, column=0, sticky="w", padx=(18, 0), pady=(4, 0))
+        self.refresh_link = tk.Label(self, text="Refresh site list", fg=self.LINK_COLOR, cursor="hand2",
+                                     font=("Segoe UI", 9, "underline"))
+        self.refresh_link.grid(row=5, column=0, sticky="w", pady=(4, 0))
+        self.refresh_link.bind("<Button-1>", lambda e: self.refresh())
+
+        self.refresh()
+
+    # ------------------------------------------------------------------
+    def _bind_wheel(self, widget):
+        widget.bind("<MouseWheel>", lambda e: self._check_canvas.yview_scroll(int(-e.delta / 120), "units"))
+        widget.bind("<Button-4>", lambda e: self._check_canvas.yview_scroll(-1, "units"))
+        widget.bind("<Button-5>", lambda e: self._check_canvas.yview_scroll(1, "units"))
+
+    def refresh(self):
+        """Reloads the site list, keeping ticks on sites that still exist."""
+        with db.get_conn() as conn:
+            infos = []
+            for site in db.get_all_sites(conn):
+                infos.append({
+                    "id": site["id"],
+                    "label": f"{site['site_name'] or site['site_octet']} ({site['site_octet']})",
+                    "devices": len(db.get_devices_for_site(conn, site["id"])),
+                })
+        if infos == self._site_info and (self._rows or not infos):
+            return  # nothing changed - leave the list (and the scroll position) alone
+        previously_checked = {sid for sid, var in self._site_vars.items() if var.get()}
+        self._site_info = infos
+
+        for child in self._check_inner.winfo_children():
+            child.destroy()
+        self._site_vars = {}
+        self._rows = {}
+        for info in infos:
+            var = tk.BooleanVar(value=info["id"] in previously_checked)
+            var.trace_add("write", lambda *a: self._update_summary())
+            self._site_vars[info["id"]] = var
+            cb = ttk.Checkbutton(self._check_inner, text=info["label"], variable=var)
+            count = ttk.Label(self._check_inner, text=f"{info['devices']} dev", foreground="#777777",
+                              font=("Segoe UI", 8))
+            for w in (cb, count):
+                self._bind_wheel(w)
+            self._rows[info["id"]] = (cb, count)
+        self._check_inner.columnconfigure(0, weight=1)
+        self._apply_filter()
+        self._apply_states()
+
+    def _apply_filter(self):
+        query = self.filter_var.get().strip().lower()
+        self._visible_ids = []
+        row = 0
+        for info in self._site_info:
+            cb, count = self._rows[info["id"]]
+            if not query or query in info["label"].lower():
+                cb.grid(row=row, column=0, sticky="w", padx=4, pady=1)
+                count.grid(row=row, column=1, sticky="e", padx=(8, 6))
+                self._visible_ids.append(info["id"])
+                row += 1
+            else:
+                cb.grid_remove()
+                count.grid_remove()
+        self._check_canvas.yview_moveto(0)
+
+    def _checklist_active(self) -> bool:
+        return self._enabled and self.scope_var.get() == "selected"
+
+    def _apply_states(self):
+        radio_state = "normal" if self._enabled else "disabled"
+        self.radio_all.configure(state=radio_state)
+        self.radio_selected.configure(state=radio_state)
+        active = self._checklist_active()
+        state = "normal" if active else "disabled"
+        self.filter_entry.configure(state=state)
+        for cb, _count in self._rows.values():
+            cb.configure(state=state)
+        self.select_all_link.configure(fg=self.LINK_COLOR if active else "#999999")
+        self.clear_link.configure(fg=self.LINK_COLOR if active else "#999999")
+        self._update_summary()
+
+    def _set_visible_checked(self, value: bool):
+        if not self._checklist_active():
+            return
+        for sid in self._visible_ids:
+            self._site_vars[sid].set(value)
+
+    def set_enabled(self, enabled: bool, note: str = ""):
+        self._enabled = enabled
+        self._disabled_note = note
+        self._apply_states()
+
+    # ------------------------------------------------------------------
+    def site_ids(self):
+        """None = every site; otherwise the ticked site ids (maybe empty)."""
+        if self.scope_var.get() == "all":
+            return None
+        return [info["id"] for info in self._site_info if self._site_vars[info["id"]].get()]
+
+    def _update_summary(self):
+        if not self._enabled:
+            self.summary_label.configure(text=self._disabled_note)
+            return
+        ids = self.site_ids()
+        if ids is None:
+            sites, devices = len(self._site_info), sum(i["devices"] for i in self._site_info)
+        else:
+            by_id = {i["id"]: i["devices"] for i in self._site_info}
+            sites, devices = len(ids), sum(by_id.get(i, 0) for i in ids)
+        if sites == 0:
+            text = "No sites selected"
+        else:
+            text = f"{sites} site{'s' if sites != 1 else ''}, {devices} device{'s' if devices != 1 else ''} in scope"
+        self.summary_label.configure(text=text)
+
+
 class DiscoveryTab(ttk.Frame):
-    """GUI over orchestrator.py's CDP/ARP/tunnel collection. Scope (one
-    site or all) and action (cdp/arp/both) pickers up top, opt-in
-    checkboxes for MAC-table and tunnel collection, a Run button, an
-    overall progress bar, one status column per active worker thread
-    (color-coded by phase, with a hover tooltip for the full detail
-    text and a highlighted border if a worker's had no update in a
-    while), and a scrolling read-only console below showing live
+    """GUI over orchestrator.py's CDP/ARP/tunnel collection. A full-height
+    Scope panel on the left (all sites, or a ticked list of sites - see
+    SiteScopePanel); on the right an Action picker (Both CDP + ARP is the
+    default), opt-in checkboxes for MAC-table and tunnel collection (on by
+    default) and for rebuilding the dashboard when the run finishes, then
+    a Run button beside the overall progress bar, one status column per
+    active worker thread (color-coded by phase, with a hover tooltip for
+    the full detail text and a highlighted border if a worker's had no
+    update in a while), and a scrolling read-only console showing live
     output from the run - which happens on a background thread so the
     window stays responsive during a multi-minute discovery pass.
     """
@@ -1533,90 +1726,115 @@ class DiscoveryTab(ttk.Frame):
         self._progress_queue = queue.Queue()
         self._progress_total = 0
         self._progress_done = 0
-        self._site_keys = []
         self._build_layout()
-        self._refresh_site_choices()
         self._poll_queue()
         self._poll_progress_queue()
         self._check_worker_staleness()
 
+    HINTS = {
+        "all": "Runs CDP discovery, then ARP collection, for the chosen scope.",
+        "cdp": "CDP discovery walks outward from each site's seed device.",
+        "arp": "ARP collection reads ARP tables for the chosen scope.",
+        "configs": "Collects running configs. Stale devices are skipped unless you include them.",
+        "enrich": "Pulls serial, model and description for every phone and VTC from CUCM. Scope is ignored.",
+        "dashboard": "Rebuilds the static dashboard for the chosen scope. No network connection is made.",
+    }
+
     def _build_layout(self):
-        self.columnconfigure(0, weight=1)
-        self.rowconfigure(5, weight=1)
+        self.columnconfigure(1, weight=1)
+        self.rowconfigure(0, weight=1)
 
-        controls = ttk.Frame(self, padding=10)
-        controls.grid(row=0, column=0, sticky="ew")
+        # Left column: scope, full height of the tab.
+        left = ttk.Frame(self, padding=(10, 10, 5, 10))
+        left.grid(row=0, column=0, sticky="ns")
+        left.rowconfigure(0, weight=1)
+        self.scope_panel = SiteScopePanel(left)
+        self.scope_panel.grid(row=0, column=0, sticky="nsew")
 
-        ttk.Label(controls, text="Scope").grid(row=0, column=0, sticky="w", padx=(0, 10))
-        self.scope_var = tk.StringVar(value="site")
-        ttk.Radiobutton(
-            controls, text="One site:", variable=self.scope_var, value="site", command=self._on_scope_changed,
-        ).grid(row=0, column=1, sticky="w")
-        self.site_combo = ttk.Combobox(controls, state="readonly", width=28)
-        self.site_combo.grid(row=0, column=2, sticky="w", padx=(4, 20))
-        ttk.Radiobutton(
-            controls, text="All sites", variable=self.scope_var, value="all", command=self._on_scope_changed,
-        ).grid(row=0, column=3, sticky="w")
+        # Right column: action, options, run/progress, thread status, console.
+        right = ttk.Frame(self, padding=(5, 10, 10, 10))
+        right.grid(row=0, column=1, sticky="nsew")
+        right.columnconfigure(0, weight=1)
+        right.rowconfigure(7, weight=1)
 
-        ttk.Label(controls, text="Action").grid(row=1, column=0, sticky="w", padx=(0, 10), pady=(8, 0))
-        self.action_var = tk.StringVar(value="cdp")
-        ttk.Radiobutton(controls, text="CDP discovery", variable=self.action_var, value="cdp",
-                        command=self._on_action_changed).grid(row=1, column=1, sticky="w", pady=(8, 0))
-        ttk.Radiobutton(controls, text="ARP collection", variable=self.action_var, value="arp",
-                        command=self._on_action_changed).grid(row=1, column=2, sticky="w", pady=(8, 0))
-        ttk.Radiobutton(controls, text="Both", variable=self.action_var, value="all",
-                        command=self._on_action_changed).grid(row=1, column=3, sticky="w", pady=(8, 0))
-        ttk.Radiobutton(controls, text="Generate dashboard", variable=self.action_var, value="dashboard",
-                        command=self._on_action_changed).grid(row=1, column=4, sticky="w", pady=(8, 0))
-        ttk.Radiobutton(controls, text="Collect configs", variable=self.action_var, value="configs",
-                        command=self._on_action_changed).grid(row=1, column=5, sticky="w", pady=(8, 0))
-        ttk.Radiobutton(controls, text="Phone/VTC enrichment", variable=self.action_var, value="enrich",
-                        command=self._on_action_changed).grid(row=1, column=6, sticky="w", pady=(8, 0))
-
-        self.collect_mac_var = tk.BooleanVar(value=False)
-        self.collect_mac_check = ttk.Checkbutton(
-            controls, text="Also collect MAC address tables (with CDP discovery)",
-            variable=self.collect_mac_var,
+        action_box = ttk.LabelFrame(right, text="Action", padding=8)
+        action_box.grid(row=0, column=0, sticky="ew")
+        action_box.columnconfigure(0, weight=1)
+        action_box.columnconfigure(1, weight=1)
+        self.action_var = tk.StringVar(value="all")
+        groups = (
+            ("Network collection", (("Both (CDP + ARP)", "all"), ("CDP discovery", "cdp"),
+                                    ("ARP collection", "arp"))),
+            ("Data and reports", (("Collect configs", "configs"), ("Phone/VTC enrichment", "enrich"),
+                                  ("Generate dashboard", "dashboard"))),
         )
-        self.collect_mac_check.grid(row=2, column=1, columnspan=4, sticky="w", pady=(4, 0))
+        for col, (title, choices) in enumerate(groups):
+            group = ttk.Frame(action_box)
+            group.grid(row=0, column=col, sticky="nw", padx=(0 if col == 0 else 20, 0))
+            ttk.Label(group, text=title.upper(), foreground="#666666", font=("Segoe UI", 8)).grid(
+                row=0, column=0, sticky="w", pady=(0, 2))
+            for i, (text, value) in enumerate(choices, start=1):
+                ttk.Radiobutton(group, text=text, variable=self.action_var, value=value,
+                                command=self._on_action_changed).grid(row=i, column=0, sticky="w", pady=1)
+
+        options_box = ttk.LabelFrame(right, text="Options", padding=8)
+        options_box.grid(row=1, column=0, sticky="ew", pady=(10, 0))
+
+        # MAC-table collection piggybacks on the CDP walk specifically
+        # (see discover_site()'s collect_mac_tables option), so it is only
+        # meaningful when CDP is part of what is about to run.
+        self.collect_mac_var = tk.BooleanVar(value=True)
+        self.collect_mac_check = ttk.Checkbutton(
+            options_box, text="Also collect MAC address tables", variable=self.collect_mac_var)
+        self.collect_mac_check.grid(row=0, column=0, sticky="w")
 
         # Unlike the MAC-table checkbox, this doesn't piggyback on the
         # CDP walk - it's its own connection to just the site's CDP
         # seed device (see orchestrator.collect_tunnels()'s docstring),
         # so it's meaningful alongside cdp OR arp, not gated to cdp
-        # specifically. Not relevant to "Generate dashboard" (no
-        # network connection at all) - see _on_action_changed().
-        self.collect_tunnels_var = tk.BooleanVar(value=False)
+        # specifically. Not relevant to "Generate dashboard" or configs
+        # (see _on_action_changed()).
+        self.collect_tunnels_var = tk.BooleanVar(value=True)
         self.collect_tunnels_check = ttk.Checkbutton(
-            controls, text="Also collect tunnel interfaces (uses each site's CDP seed device)",
-            variable=self.collect_tunnels_var,
-        )
-        self.collect_tunnels_check.grid(row=3, column=1, columnspan=4, sticky="w", pady=(4, 0))
+            options_box, text="Also collect tunnel interfaces (uses each site's CDP seed device)",
+            variable=self.collect_tunnels_var)
+        self.collect_tunnels_check.grid(row=1, column=0, sticky="w", pady=(4, 0))
 
         # Config collection skips stale devices (manually marked, or aged
         # out) by default, since they are the likeliest to time out.
         self.config_stale_var = tk.BooleanVar(value=False)
         self.config_stale_check = ttk.Checkbutton(
-            controls, text="Include stale devices (config collection only)", variable=self.config_stale_var,
-        )
-        self.config_stale_check.grid(row=4, column=1, columnspan=4, sticky="w", pady=(4, 0))
+            options_box, text="Include stale devices", variable=self.config_stale_var)
+        self.config_stale_check.grid(row=2, column=0, sticky="w", pady=(4, 0))
 
-        self.run_button = ttk.Button(controls, text="Run", command=self._on_run_clicked)
-        self.run_button.grid(row=0, column=7, rowspan=2, sticky="ns", padx=(20, 0))
+        # Rebuilds the dashboard pages for this run's scope once the run
+        # is done, so a discovery run and a dashboard update are one step.
+        self.dashboard_after_var = tk.BooleanVar(value=True)
+        self.dashboard_after_check = ttk.Checkbutton(
+            options_box, text="Update dashboard when finished", variable=self.dashboard_after_var)
+        self.dashboard_after_check.grid(row=3, column=0, sticky="w", pady=(4, 0))
+
+        self.hint_label = tk.Label(
+            right, text="", anchor="w", justify="left", background="#fff8e1", foreground="#4a3b00",
+            relief="solid", borderwidth=1, padx=8, pady=4)
+        self.hint_label.grid(row=2, column=0, sticky="ew", pady=(10, 0))
+        right.bind("<Configure>", lambda e: self.hint_label.configure(wraplength=max(200, e.width - 40)))
 
         # Overall progress: how many of the sites in this run have
         # finished (successfully or not) - one determinate step per
         # site, incremented once each site's _run_site_actions()
         # completes (see run_for_sites()'s progress_cb "done"/"error"
         # events), not per individual device/action within a site.
-        progress_frame = ttk.Frame(self, padding=(10, 6, 10, 0))
-        progress_frame.grid(row=1, column=0, sticky="ew")
-        progress_frame.columnconfigure(0, weight=1)
+        progress_frame = ttk.Frame(right)
+        progress_frame.grid(row=3, column=0, sticky="ew", pady=(10, 0))
+        progress_frame.columnconfigure(1, weight=1)
 
+        self.run_button = ttk.Button(progress_frame, text="Run", command=self._on_run_clicked)
+        self.run_button.grid(row=0, column=0, sticky="w", padx=(0, 10))
         self.progress_bar = ttk.Progressbar(progress_frame, mode="determinate", maximum=1, value=0)
-        self.progress_bar.grid(row=0, column=0, sticky="ew")
+        self.progress_bar.grid(row=0, column=1, sticky="ew")
         self.progress_label = ttk.Label(progress_frame, text="")
-        self.progress_label.grid(row=0, column=1, sticky="w", padx=(10, 0))
+        self.progress_label.grid(row=0, column=2, sticky="w", padx=(10, 0))
 
         # Per-worker status: one column per concurrently-running worker
         # slot (not per site - with up to DISCOVERY_MAX_WORKERS threads
@@ -1627,18 +1845,18 @@ class DiscoveryTab(ttk.Frame):
         # message available on hover. Built fresh (see
         # _init_worker_strip()) at the start of each run, sized to
         # however many workers this specific run can actually use.
-        ttk.Label(self, text="Thread status").grid(row=2, column=0, sticky="w", padx=10, pady=(6, 0))
-        self.worker_strip = ttk.Frame(self, padding=(10, 2, 10, 0))
-        self.worker_strip.grid(row=3, column=0, sticky="ew")
+        ttk.Label(right, text="Thread status").grid(row=4, column=0, sticky="w", pady=(8, 0))
+        self.worker_strip = ttk.Frame(right, padding=(0, 2, 0, 0))
+        self.worker_strip.grid(row=5, column=0, sticky="ew")
         self._worker_cells = []       # list of dicts, index = slot - 1
         self._worker_last_seen = {}   # slot -> time.monotonic() of its last update
         self._worker_phase = {}       # slot -> current phase string
         self._tooltip = _Tooltip(self)
 
-        ttk.Label(self, text="Console").grid(row=4, column=0, sticky="w", padx=10, pady=(6, 0))
+        ttk.Label(right, text="Console").grid(row=6, column=0, sticky="w", pady=(8, 0))
 
-        console_frame = ttk.Frame(self, padding=(10, 4, 10, 10))
-        console_frame.grid(row=5, column=0, sticky="nsew")
+        console_frame = ttk.Frame(right, padding=(0, 4, 0, 0))
+        console_frame.grid(row=7, column=0, sticky="nsew")
         console_frame.rowconfigure(0, weight=1)
         console_frame.columnconfigure(0, weight=1)
 
@@ -1648,46 +1866,23 @@ class DiscoveryTab(ttk.Frame):
         )
         self.console.grid(row=0, column=0, sticky="nsew")
 
-        self._on_scope_changed()
         self._on_action_changed()
 
-    def _on_scope_changed(self):
-        # Phone/VTC enrichment always covers every phone and VTC, so the
-        # site picker means nothing for it.
-        site_usable = self.scope_var.get() == "site" and self.action_var.get() != "enrich"
-        self.site_combo.configure(state="readonly" if site_usable else "disabled")
-
     def _on_action_changed(self):
-        # MAC-table collection piggybacks on the CDP walk specifically
-        # (see discover_site()'s collect_mac_tables option) - only
-        # meaningful when CDP is actually part of what's about to run.
-        self._on_scope_changed()
-        collect_mac_relevant = self.action_var.get() in ("cdp", "all")
-        self.collect_mac_check.configure(state="normal" if collect_mac_relevant else "disabled")
-
-        # Tunnel collection doesn't piggyback on anything - it's its
-        # own connection to the CDP seed (see
-        # orchestrator.collect_tunnels()), so it's relevant for any
-        # action that actually touches the network. Only "Generate
-        # dashboard" (no network connection at all) disables it.
-        collect_tunnels_relevant = self.action_var.get() in ("cdp", "arp", "all")  # not "configs"
-        self.collect_tunnels_check.configure(state="normal" if collect_tunnels_relevant else "disabled")
-        self.config_stale_check.configure(state="normal" if self.action_var.get() == "configs" else "disabled")
+        action = self.action_var.get()
+        self.collect_mac_check.configure(state="normal" if action in ("cdp", "all") else "disabled")
+        self.collect_tunnels_check.configure(state="normal" if action in ("cdp", "arp", "all") else "disabled")
+        self.config_stale_check.configure(state="normal" if action == "configs" else "disabled")
+        self.dashboard_after_check.configure(state="normal" if action != "dashboard" else "disabled")
+        # Phone/VTC enrichment always covers every phone and VTC, so the
+        # site scope means nothing for it.
+        self.scope_panel.set_enabled(
+            action != "enrich", note="Not used: enrichment covers every phone and VTC.")
+        self.hint_label.configure(text=self.HINTS[action])
 
     def refresh(self):
         """Called by App each time this tab is switched to."""
-        self._refresh_site_choices()
-
-    def _refresh_site_choices(self):
-        idx = self.site_combo.current()
-        previous_id = self._site_keys[idx] if 0 <= idx < len(self._site_keys) else None
-        with db.get_conn() as conn:
-            sites = db.get_all_sites(conn)
-        self._site_keys = [site["id"] for site in sites]
-        display_values = [f"{site['site_name'] or site['site_octet']} ({site['site_octet']})" for site in sites]
-        self.site_combo["values"] = display_values
-        if display_values:
-            self.site_combo.current(self._site_keys.index(previous_id) if previous_id in self._site_keys else 0)
+        self.scope_panel.refresh()
 
     def _append_console(self, text: str):
         self.console.configure(state="normal")
@@ -1861,10 +2056,16 @@ class DiscoveryTab(ttk.Frame):
             return  # defensive - the button should already be disabled during a run
 
         action = self.action_var.get()
+        update_dashboard = self.dashboard_after_var.get() and action != "dashboard"
 
-        if action != "enrich" and self.scope_var.get() == "site" and self.site_combo.current() < 0:
-            messagebox.showwarning("Discovery", "Choose a site first, or select 'All sites'.")
-            return
+        # None = every site; a list = the ticked sites. Enrichment always
+        # covers every phone and VTC, so it ignores scope.
+        site_ids = None
+        if action != "enrich":
+            site_ids = self.scope_panel.site_ids()
+            if site_ids is not None and not site_ids:
+                messagebox.showwarning("Discovery", "Tick at least one site, or choose 'All sites'.")
+                return
 
         if action == "enrich":
             # Needs the 'cucm' and 'vtc' credentials, not 'tacacs'. Imported
@@ -1882,7 +2083,8 @@ class DiscoveryTab(ttk.Frame):
             self._clear_console()
             self._reset_progress_display()
             self.run_button.configure(state="disabled")
-            self._worker_thread = threading.Thread(target=self._run_enrich_worker, daemon=True)
+            self._worker_thread = threading.Thread(
+                target=self._run_enrich_worker, args=(update_dashboard,), daemon=True)
             self._worker_thread.start()
             return
 
@@ -1894,103 +2096,135 @@ class DiscoveryTab(ttk.Frame):
                 return
             creds = self._creds
 
-        site_id = None
-        if self.scope_var.get() == "site":
-            site_id = self._site_keys[self.site_combo.current()]
-
         self._clear_console()
         self._reset_progress_display()
         self.run_button.configure(state="disabled")
 
         if action == "dashboard":
-            worker_target, worker_args = self._run_dashboard_worker, (site_id,)
+            worker_target, worker_args = self._run_dashboard_worker, (site_ids,)
         else:
             actions = ["cdp", "arp"] if action == "all" else [action]
             collect_mac_tables = self.collect_mac_var.get() and action in ("cdp", "all")
             collect_tunnels_flag = self.collect_tunnels_var.get() and action in ("cdp", "arp", "all")
             config_include_stale = self.config_stale_var.get() and action == "configs"
             worker_target, worker_args = self._run_worker, (
-                site_id, actions, creds, collect_mac_tables, collect_tunnels_flag, config_include_stale,
+                site_ids, actions, creds, collect_mac_tables, collect_tunnels_flag, config_include_stale,
+                update_dashboard,
             )
 
         self._worker_thread = threading.Thread(target=worker_target, args=worker_args, daemon=True)
         self._worker_thread.start()
 
-    def _run_enrich_worker(self):
+    def _run_enrich_worker(self, update_dashboard=False):
         original_stdout = sys.stdout
         sys.stdout = _QueueWriter(self._output_queue)
+        run_ok = False
         try:
             import cucm_enrich
             db.log_activity("cucm_enrich", "Phone/VTC enrichment (RIS + AXL descriptions)")
             cucm_enrich.run(self._creds)
+            run_ok = True
         except Exception as e:
             print(f"ERROR: {e}")
+        try:
+            # Descriptions show on the site pages and the client search
+            # page, so enrichment changes every site's pages.
+            if run_ok and update_dashboard:
+                self._auto_update_dashboard(None, "Phone/VTC enrichment")
         finally:
             sys.stdout = original_stdout
             self._output_queue.put(_DONE)
 
-    def _run_dashboard_worker(self, site_id):
+    def _run_dashboard_worker(self, site_ids):
         original_stdout = sys.stdout
         sys.stdout = _QueueWriter(self._output_queue)
         try:
-            scope_label = "all sites" if site_id is None else f"site id {site_id}"
-            db.log_activity("generate_dashboard", f"Generate dashboard - {scope_label}")
-            if site_id is None:
-                dashboard_generate.generate_all()
-                with db.get_conn() as conn:
-                    cfg = config_viewer.generate_config_pages(conn)
-                print(f"  Wrote config viewer: {cfg['devices']} device(s), {cfg['written']} rebuilt, "
-                      f"{cfg['skipped']} unchanged")
+            if site_ids is None:
+                scope_label = "all sites"
             else:
-                with db.get_conn() as conn:
-                    # Looked up by primary key, same reasoning as
-                    # _run_worker below - unambiguous, unlike a
-                    # string-key lookup.
-                    site = db.get_site_by_id(conn, site_id)
-                    if site is None:
-                        print(f"Selected site (id {site_id}) no longer exists - try refreshing.")
-                    else:
-                        # generate_site()/generate_index() are silent by
-                        # design (only the CLI-facing generate_all()/
-                        # generate_one() wrappers print) - print here so
-                        # the console shows something happened.
-                        path = dashboard_generate.generate_site(conn, site)
-                        print(f"  Wrote {path}")
-                        # Regenerating one site's page should also
-                        # refresh the index, since it shows aggregate
-                        # counts/timestamps that would otherwise go
-                        # stale the moment this site's data changes.
-                        index_path = dashboard_generate.generate_index(conn)
-                        print(f"  Wrote {index_path}")
-                        # Same reasoning - this site's own cross-site
-                        # links/tunnels can change the all-site map too
-                        # (a new inter-site edge, a newly-matched
-                        # tunnel), so it's kept in lockstep with the
-                        # index rather than only refreshed on a full
-                        # "all sites" run.
-                        site_map_path = dashboard_generate.generate_site_map(conn)
-                        print(f"  Wrote {site_map_path}")
-                        kg_path = kg_pages.generate_kg_page(conn)
-                        if kg_path:
-                            print(f"  Wrote {kg_path}")
-                        # Config viewer: this site's device data files
-                        # are rebuilt (others untouched); the viewer's
-                        # device index is always refreshed.
-                        cfg = config_viewer.generate_config_pages(conn, site_id=site["id"])
-                        print(f"  Wrote config viewer: {cfg['written']} device file(s) rebuilt for this site")
+                scope_label = f"{len(site_ids)} site(s), ids {', '.join(str(i) for i in site_ids)}"
+            db.log_activity("generate_dashboard", f"Generate dashboard - {scope_label}")
+            self._generate_dashboard(site_ids)
         except Exception as e:
             print(f"ERROR: {e}")
         finally:
             sys.stdout = original_stdout
             self._output_queue.put(_DONE)
 
-    def _run_worker(self, site_id, actions, creds, collect_mac_tables=False, collect_tunnels_flag=False,
-                    config_include_stale=False):
+    def _auto_update_dashboard(self, site_ids, source: str):
+        """The "Update dashboard when finished" step, run on the same worker
+        thread right after a discovery/enrichment run (output goes to the
+        same console). Never raises - a dashboard problem must not hide the
+        fact that the run itself finished."""
+        print("\n=== Updating dashboard ===")
+        try:
+            if site_ids is None:
+                scope_label = "all sites"
+            else:
+                scope_label = f"{len(site_ids)} site(s)"
+            db.log_activity("generate_dashboard", f"Generate dashboard - {scope_label} (automatic, after {source})")
+            self._generate_dashboard(site_ids)
+        except Exception as e:
+            print(f"ERROR updating dashboard: {e}")
+
+    def _generate_dashboard(self, site_ids):
+        """Rebuilds dashboard pages and prints what was written. site_ids None
+        = everything. Raises on failure; callers handle stdout and errors."""
+        if site_ids is None:
+            dashboard_generate.generate_all()
+            with db.get_conn() as conn:
+                cfg = config_viewer.generate_config_pages(conn)
+            print(f"  Wrote config viewer: {cfg['devices']} device(s), {cfg['written']} rebuilt, "
+                  f"{cfg['skipped']} unchanged")
+            return
+
+        with db.get_conn() as conn:
+            # Looked up by primary key - unambiguous, unlike a
+            # string-key lookup.
+            sites = []
+            for site_id in site_ids:
+                site = db.get_site_by_id(conn, site_id)
+                if site is None:
+                    print(f"Selected site (id {site_id}) no longer exists - try refreshing.")
+                else:
+                    sites.append(site)
+            if not sites:
+                return
+            for site in sites:
+                # generate_site()/generate_index() are silent by design
+                # (only the CLI-facing generate_all()/generate_one()
+                # wrappers print) - print here so the console shows
+                # something happened.
+                print(f"  Wrote {dashboard_generate.generate_site(conn, site)}")
+            # Regenerating site pages should also refresh the index, since
+            # it shows aggregate counts/timestamps that would otherwise go
+            # stale the moment a site's data changes.
+            print(f"  Wrote {dashboard_generate.generate_index(conn)}")
+            # Same reasoning - these sites' own cross-site links/tunnels
+            # can change the all-site map too (a new inter-site edge, a
+            # newly-matched tunnel), so it's kept in lockstep with the
+            # index rather than only refreshed on a full "all sites" run.
+            print(f"  Wrote {dashboard_generate.generate_site_map(conn)}")
+            kg_path = kg_pages.generate_kg_page(conn)
+            if kg_path:
+                print(f"  Wrote {kg_path}")
+            # Config viewer: each site's device data files are rebuilt
+            # (others untouched); the viewer's device index is always
+            # refreshed.
+            rebuilt = 0
+            for site in sites:
+                rebuilt += config_viewer.generate_config_pages(conn, site_id=site["id"])["written"]
+            print(f"  Wrote config viewer: {rebuilt} device file(s) rebuilt")
+
+    def _run_worker(self, site_ids, actions, creds, collect_mac_tables=False, collect_tunnels_flag=False,
+                    config_include_stale=False, update_dashboard=False):
         original_stdout = sys.stdout
         sys.stdout = _QueueWriter(self._output_queue)
+        run_ok = False
+        dashboard_ids = None
         try:
             with db.get_conn() as conn:
-                if site_id is None:
+                if site_ids is None:
                     # Excludes "Unassigned" - it never has a seed
                     # device, so including it in an "All sites" scan is
                     # pure overhead (picked up, immediately reports "no
@@ -2003,14 +2237,19 @@ class DiscoveryTab(ttk.Frame):
                     # find_site_by_any_key(), which risks matching the
                     # wrong site if some other site's name/code happens
                     # to coincidentally equal this one's octet.
-                    site = db.get_site_by_id(conn, site_id)
-                    sites = [site] if site is not None else []
+                    sites = []
+                    for site_id in site_ids:
+                        site = db.get_site_by_id(conn, site_id)
+                        if site is None:
+                            print(f"Selected site (id {site_id}) no longer exists - try refreshing.")
+                        else:
+                            sites.append(site)
 
             if not sites:
-                if site_id is None:
+                if site_ids is None:
                     print("No sites found in the database.")
                 else:
-                    print(f"Selected site (id {site_id}) no longer exists - try refreshing.")
+                    print("None of the selected sites exist any more - try refreshing the site list.")
             else:
                 # Seeds the progress bar and builds one worker-status
                 # column per worker this run can actually use, before
@@ -2033,6 +2272,10 @@ class DiscoveryTab(ttk.Frame):
                     config_include_stale=config_include_stale,
                     progress_cb=self._on_discovery_progress,
                 )
+                # run_for_sites() prints and moves past a failing site, so
+                # reaching here means the run as a whole completed.
+                run_ok = True
+                dashboard_ids = None if site_ids is None else [s["id"] for s in sites]
         except Exception as e:
             print(f"ERROR: {e}")
         finally:
@@ -2049,8 +2292,12 @@ class DiscoveryTab(ttk.Frame):
                 write_queue.try_drain()
             except Exception as e:
                 print(f"Warning: final queue drain failed: {e}")
-            sys.stdout = original_stdout
-            self._output_queue.put(_DONE)
+            try:
+                if run_ok and update_dashboard:
+                    self._auto_update_dashboard(dashboard_ids, "+".join(actions))
+            finally:
+                sys.stdout = original_stdout
+                self._output_queue.put(_DONE)
 
 
 class ExportTab(ttk.Frame):
@@ -3247,7 +3494,7 @@ class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("Site Awareness Dashboard")
-        self.geometry("900x560")
+        self.geometry("1000x700")
 
         db.init_db()
 
